@@ -31,7 +31,7 @@
     "extensions": [
       "./src/index.ts"
     ],
-    "image": "https://placehold.co/1200x630/png?text=Pi+Codex+Web+Search"
+    "image": "https://i.imgur.com/EVZNCaE.png"
   },
   "peerDependencies": {
     "@mariozechner/pi-ai": "*",
