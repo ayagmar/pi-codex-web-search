@@ -1,117 +1,345 @@
-import { Type } from "@sinclair/typebox";
-import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
+import { StringEnum } from "@mariozechner/pi-ai";
 import {
-  DEFAULT_LABEL,
-  EXTENSION_COMMAND,
-  EXTENSION_NAME,
-  STATE_ENTRY_TYPE,
-  TOOL_NAME,
-} from "./constants.js";
-import { buildHelpText, parseSubcommand } from "./commands.js";
-import { buildEchoText } from "./tool.js";
-import type { ExtensionState } from "./types.js";
+  keyHint,
+  type ExtensionAPI,
+  type ExtensionCommandContext,
+} from "@mariozechner/pi-coding-agent";
+import { Text } from "@mariozechner/pi-tui";
+import { Type } from "@sinclair/typebox";
+import { executeCodexWebSearch } from "./codex.js";
+import { SETTINGS_COMMAND, TOOL_NAME } from "./constants.js";
+import {
+  DEFAULT_WEB_SEARCH_SETTINGS,
+  formatSettings,
+  loadSettings,
+  saveSettings,
+} from "./settings.js";
+import type {
+  CodexWebSearchDetails,
+  ExecuteCodexWebSearchOptions,
+  SearchFreshness,
+  SearchMode,
+  WebSearchProgressDetails,
+} from "./types.js";
 
-export default function extensionTemplate(pi: ExtensionAPI) {
-  let state: ExtensionState = { label: DEFAULT_LABEL };
-
-  function syncState(ctx: Pick<ExtensionContext, "sessionManager" | "hasUI" | "ui">): void {
-    state = restoreFromContext(ctx);
-    if (ctx.hasUI) {
-      ctx.ui.setStatus(EXTENSION_COMMAND, `${EXTENSION_NAME}: ${state.label}`);
-    }
-  }
-
-  pi.on("session_start", (_event, ctx) => syncState(ctx));
-  pi.on("session_switch", (_event, ctx) => syncState(ctx));
-  pi.on("session_tree", (_event, ctx) => syncState(ctx));
-  pi.on("session_fork", (_event, ctx) => syncState(ctx));
-
-  pi.registerCommand(EXTENSION_COMMAND, {
-    description: "Starter command for your extension",
-    getArgumentCompletions: (prefix) => {
-      const options = ["status", "set-label", "help"];
-      const safePrefix = prefix.toLowerCase();
-      const matches = options.filter((option) => option.startsWith(safePrefix));
-      return matches.length > 0 ? matches.map((value) => ({ value, label: value })) : null;
-    },
-    handler: (args, ctx): Promise<void> => {
-      const { name, rest } = parseSubcommand(args);
-
-      switch (name) {
-        case "status":
-          notify(ctx, `Label: ${state.label}`);
-          return Promise.resolve();
-
-        case "set-label": {
-          if (!rest) {
-            notify(ctx, buildHelpText());
-            return Promise.resolve();
-          }
-          state = { label: rest };
-          pi.appendEntry(STATE_ENTRY_TYPE, state);
-          if (ctx.hasUI) {
-            ctx.ui.setStatus(EXTENSION_COMMAND, `${EXTENSION_NAME}: ${state.label}`);
-          }
-          notify(ctx, `Label updated to: ${state.label}`);
-          return Promise.resolve();
-        }
-
-        default:
-          notify(ctx, buildHelpText());
-          return Promise.resolve();
-      }
-    },
-  });
-
+export default function codexWebSearchExtension(pi: ExtensionAPI) {
   pi.registerTool({
     name: TOOL_NAME,
-    label: "Echo",
-    description: "Echo text back to the model. Safe default tool for template projects.",
+    label: "Web Search",
+    description:
+      "Search the public web through the locally installed Codex CLI and return a concise summary with sources. Use fast mode for quick factual lookups and deep mode only when the user explicitly wants broader research. Defaults are configurable via /web-search-settings. Output is truncated to Pi's standard limits when needed. Requires `codex` to be installed and authenticated on this machine.",
     parameters: Type.Object({
-      message: Type.String({ description: "Text to echo back" }),
-      uppercase: Type.Optional(Type.Boolean({ description: "Return the message in upper case" })),
+      query: Type.String({ description: "What to search for on the web" }),
+      maxSources: Type.Optional(
+        Type.Integer({
+          minimum: 1,
+          maximum: 10,
+          description: "Maximum number of sources to include in the result (default: 5)",
+        })
+      ),
+      mode: Type.Optional(
+        StringEnum(["fast", "deep"] as const, {
+          description:
+            "Search depth. Use fast for simple lookups. Use deep only when the user explicitly asks for broader research.",
+        })
+      ),
     }),
-    execute(_toolCallId, params) {
-      const text = buildEchoText(params);
-      return Promise.resolve({
-        content: [{ type: "text", text }],
-        details: { length: text.length },
-      });
+    async execute(_toolCallId, params, signal, onUpdate, ctx) {
+      const options: ExecuteCodexWebSearchOptions = {
+        cwd: ctx.cwd,
+        settings: await loadSettings(),
+      };
+
+      if (signal) options.signal = signal;
+      if (onUpdate) options.onUpdate = onUpdate;
+
+      return executeCodexWebSearch(params, options);
+    },
+    renderCall(args, theme) {
+      let text = theme.fg("toolTitle", theme.bold("web_search "));
+      text += theme.fg("accent", formatInlineQuery(args.query));
+      text += theme.fg("dim", ` [${args.mode ?? "default"}]`);
+      if (args.maxSources) {
+        text += theme.fg("dim", ` (${args.maxSources} sources max)`);
+      }
+      return new Text(text, 0, 0);
+    },
+    renderResult(result, { expanded, isPartial }, theme) {
+      if (isPartial) {
+        const details = result.details as WebSearchProgressDetails | undefined;
+        return new Text(renderProgress(details, expanded, theme), 0, 0);
+      }
+
+      const details = result.details as CodexWebSearchDetails | undefined;
+      if (!details) {
+        return new Text(theme.fg("dim", "No web search details available"), 0, 0);
+      }
+
+      let text = theme.fg(
+        "success",
+        `✓ ${details.sourceCount} source${details.sourceCount === 1 ? "" : "s"}`
+      );
+      text += theme.fg(
+        "muted",
+        ` from ${details.searchCount} search${details.searchCount === 1 ? "" : "es"} [${details.mode}/${details.freshness}]`
+      );
+
+      if (details.truncated) {
+        text += theme.fg("warning", " (truncated)");
+      }
+
+      if (!expanded) {
+        text += theme.fg("dim", ` (${keyHint("expandTools", "to expand")})`);
+        if (details.latestQuery) {
+          text += `\n${theme.fg("dim", `Last query: ${formatInlineQuery(details.latestQuery, 110)}`)}`;
+        }
+        return new Text(text, 0, 0);
+      }
+
+      text += `\n${theme.fg("muted", `Original request: ${details.query}`)}`;
+      if (details.searchQueries.length > 0) {
+        text += `\n${theme.fg("muted", `Queries (${details.searchQueries.length}):`)}`;
+        for (const [index, query] of details.searchQueries.entries()) {
+          text += `\n${theme.fg("dim", `  ${index + 1}. ${query}`)}`;
+        }
+      }
+
+      const content = result.content.find((part) => part.type === "text");
+      if (content?.type === "text") {
+        text += `\n\n${content.text
+          .split("\n")
+          .map((line) => theme.fg("toolOutput", line))
+          .join("\n")}`;
+      }
+
+      return new Text(text, 0, 0);
+    },
+  });
+
+  pi.registerCommand(SETTINGS_COMMAND, {
+    description: "Configure default mode and freshness for the web_search tool",
+    getArgumentCompletions: (prefix) => {
+      const options = [
+        "status",
+        "reset",
+        "default-mode fast",
+        "default-mode deep",
+        "fast-freshness cached",
+        "fast-freshness live",
+        "deep-freshness cached",
+        "deep-freshness live",
+      ];
+      const lowerPrefix = prefix.toLowerCase();
+      const matches = options.filter((option) => option.startsWith(lowerPrefix));
+      return matches.length > 0 ? matches.map((value) => ({ value, label: value })) : null;
+    },
+    handler: async (args, ctx) => {
+      const trimmedArgs = args.trim();
+
+      if (!trimmedArgs) {
+        if (ctx.hasUI) {
+          await openSettingsDialog(ctx);
+          return;
+        }
+        notify(ctx, buildSettingsHelp(await loadSettings()));
+        return;
+      }
+
+      await handleSettingsCommand(trimmedArgs, ctx);
     },
   });
 }
 
-/** Notify via TUI when available, otherwise console. */
+async function handleSettingsCommand(args: string, ctx: ExtensionCommandContext): Promise<void> {
+  const settings = await loadSettings();
+  const [command, value] = splitArgs(args);
+
+  try {
+    switch (command) {
+      case "status":
+        notify(ctx, buildSettingsHelp(settings));
+        return;
+
+      case "reset": {
+        const saved = await saveSettings(DEFAULT_WEB_SEARCH_SETTINGS);
+        notify(ctx, `Web search settings reset.\n\n${formatSettings(saved)}`);
+        return;
+      }
+
+      case "default-mode": {
+        const mode = parseMode(value);
+        const saved = await saveSettings({ ...settings, defaultMode: mode });
+        notify(ctx, `Default mode updated to ${saved.defaultMode}.`);
+        return;
+      }
+
+      case "fast-freshness": {
+        const freshness = parseFreshness(value);
+        const saved = await saveSettings({ ...settings, fastFreshness: freshness });
+        notify(ctx, `Fast freshness updated to ${saved.fastFreshness}.`);
+        return;
+      }
+
+      case "deep-freshness": {
+        const freshness = parseFreshness(value);
+        const saved = await saveSettings({ ...settings, deepFreshness: freshness });
+        notify(ctx, `Deep freshness updated to ${saved.deepFreshness}.`);
+        return;
+      }
+
+      default:
+        notify(ctx, buildSettingsHelp(settings));
+    }
+  } catch (error) {
+    notify(ctx, error instanceof Error ? error.message : String(error), "error");
+  }
+}
+
+async function openSettingsDialog(ctx: ExtensionCommandContext): Promise<void> {
+  const settings = await loadSettings();
+  const choice = await ctx.ui.select("Web search settings", [
+    `Show current settings`,
+    `Default mode: ${settings.defaultMode}`,
+    `Fast freshness: ${settings.fastFreshness}`,
+    `Deep freshness: ${settings.deepFreshness}`,
+    "Reset to defaults",
+  ]);
+
+  if (!choice) return;
+
+  switch (choice) {
+    case "Show current settings":
+      notify(ctx, buildSettingsHelp(settings));
+      return;
+
+    case `Default mode: ${settings.defaultMode}`: {
+      const mode = await ctx.ui.select("Choose the default mode", ["fast", "deep"]);
+      if (!mode) return;
+      const saved = await saveSettings({ ...settings, defaultMode: parseMode(mode) });
+      notify(ctx, `Default mode updated to ${saved.defaultMode}.`);
+      return;
+    }
+
+    case `Fast freshness: ${settings.fastFreshness}`: {
+      const freshness = await ctx.ui.select("Choose fast-mode freshness", ["cached", "live"]);
+      if (!freshness) return;
+      const saved = await saveSettings({
+        ...settings,
+        fastFreshness: parseFreshness(freshness),
+      });
+      notify(ctx, `Fast freshness updated to ${saved.fastFreshness}.`);
+      return;
+    }
+
+    case `Deep freshness: ${settings.deepFreshness}`: {
+      const freshness = await ctx.ui.select("Choose deep-mode freshness", ["cached", "live"]);
+      if (!freshness) return;
+      const saved = await saveSettings({
+        ...settings,
+        deepFreshness: parseFreshness(freshness),
+      });
+      notify(ctx, `Deep freshness updated to ${saved.deepFreshness}.`);
+      return;
+    }
+
+    case "Reset to defaults": {
+      const saved = await saveSettings(DEFAULT_WEB_SEARCH_SETTINGS);
+      notify(ctx, `Web search settings reset.\n\n${formatSettings(saved)}`);
+      return;
+    }
+  }
+}
+
+function buildSettingsHelp(settings: {
+  defaultMode: SearchMode;
+  fastFreshness: SearchFreshness;
+  deepFreshness: SearchFreshness;
+}): string {
+  return [
+    "Current web search settings:",
+    formatSettings(settings),
+    "",
+    `Commands:`,
+    `/${SETTINGS_COMMAND} status`,
+    `/${SETTINGS_COMMAND} default-mode <fast|deep>`,
+    `/${SETTINGS_COMMAND} fast-freshness <cached|live>`,
+    `/${SETTINGS_COMMAND} deep-freshness <cached|live>`,
+    `/${SETTINGS_COMMAND} reset`,
+  ].join("\n");
+}
+
+function splitArgs(args: string): [string, string] {
+  const trimmed = args.trim();
+  const separatorIndex = trimmed.indexOf(" ");
+  if (separatorIndex === -1) {
+    return [trimmed, ""];
+  }
+  return [trimmed.slice(0, separatorIndex), trimmed.slice(separatorIndex + 1).trim()];
+}
+
+function parseMode(value: string): SearchMode {
+  if (value === "fast" || value === "deep") {
+    return value;
+  }
+  throw new Error(`Invalid mode: ${value}. Expected fast or deep.`);
+}
+
+function parseFreshness(value: string): SearchFreshness {
+  if (value === "cached" || value === "live") {
+    return value;
+  }
+  throw new Error(`Invalid freshness: ${value}. Expected cached or live.`);
+}
+
 function notify(
-  ctx: { hasUI: boolean; ui: { notify: (message: string, level: "info") => void } },
-  message: string
+  ctx: Pick<ExtensionCommandContext, "hasUI" | "ui">,
+  message: string,
+  level: "info" | "warning" | "error" = "info"
 ): void {
   if (ctx.hasUI) {
-    ctx.ui.notify(message, "info");
-  } else {
-    console.log(message);
+    ctx.ui.notify(message, level);
+    return;
   }
+  console.log(message);
 }
 
-function restoreFromContext(ctx: Pick<ExtensionContext, "sessionManager">): ExtensionState {
-  return restoreState(ctx.sessionManager.getBranch()) ?? { label: DEFAULT_LABEL };
-}
-
-function restoreState(
-  entries: { type?: string; customType?: string; data?: unknown }[]
-): ExtensionState | undefined {
-  for (let i = entries.length - 1; i >= 0; i -= 1) {
-    const entry = entries[i];
-    if (entry?.type !== "custom" || entry.customType !== STATE_ENTRY_TYPE) continue;
-    if (isExtensionState(entry.data)) return entry.data;
+function renderProgress(
+  details: WebSearchProgressDetails | undefined,
+  expanded: boolean,
+  theme: {
+    fg: (color: "warning" | "dim" | "muted", text: string) => string;
   }
-  return undefined;
-}
-
-function isExtensionState(value: unknown): value is ExtensionState {
-  return (
-    Boolean(value) &&
-    typeof value === "object" &&
-    typeof (value as { label?: unknown }).label === "string"
+): string {
+  const searchCount = details?.searchCount ?? 0;
+  const mode = details?.mode ?? "fast";
+  const freshness = details?.freshness ?? "cached";
+  let text = theme.fg(
+    "warning",
+    `Searching the web [${mode}/${freshness}] · ${searchCount} ${searchCount === 1 ? "query" : "queries"} so far`
   );
+
+  if (!expanded) {
+    text += theme.fg("dim", ` (${keyHint("expandTools", "to expand")})`);
+    if (details?.latestQuery) {
+      text += `\n${theme.fg("dim", `Latest: ${formatInlineQuery(details.latestQuery, 110)}`)}`;
+    }
+    return text;
+  }
+
+  if (!details || details.searchQueries.length === 0) {
+    text += `\n${theme.fg("dim", "Waiting for Codex to emit search queries...")}`;
+    return text;
+  }
+
+  text += `\n${theme.fg("muted", "Queries:")}`;
+  for (const [index, query] of details.searchQueries.entries()) {
+    text += `\n${theme.fg("dim", `  ${index + 1}. ${query}`)}`;
+  }
+  return text;
+}
+
+function formatInlineQuery(query: unknown, maxLength = 90): string {
+  const text = typeof query === "string" ? query.trim() : "";
+  if (!text) return "…";
+  return text.length > maxLength ? `${text.slice(0, maxLength - 1)}…` : text;
 }

@@ -1,7 +1,9 @@
-export const EXTENSION_NAME = "my-pi-extension";
-export const EXTENSION_COMMAND = "myext";
-export const TOOL_NAME = "myext_echo";
-export const STATE_ENTRY_TYPE = "myext:state";
+export const TOOL_NAME = "web_search";
+export const SETTINGS_COMMAND = "web-search-settings";
 
-export const DEFAULT_LABEL = "Template ready";
-export const MAX_MESSAGE_LENGTH = 500;
+export const DEFAULT_MAX_SOURCES = 5;
+export const MAX_ALLOWED_SOURCES = 10;
+export const FAST_SEARCH_TIMEOUT_MS = 60_000;
+export const DEEP_SEARCH_TIMEOUT_MS = 180_000;
+export const FAST_SEARCH_QUERY_BUDGET = 6;
+export const DEEP_SEARCH_QUERY_BUDGET = 24;
