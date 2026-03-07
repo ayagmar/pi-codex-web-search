@@ -128,6 +128,24 @@ pnpm install
 pnpm run check
 ```
 
+## Release
+
+This repo includes a manual GitHub Actions release workflow modeled after the one used in `pi-copilot-queue`.
+
+Requirements:
+
+- `NPM_TOKEN` GitHub Actions secret configured for the repository
+- permissions to run the `Release` workflow
+
+You can trigger it from GitHub Actions with a `patch`, `minor`, or `major` bump, plus an optional first-release flag.
+
+Local equivalents:
+
+```bash
+pnpm run release
+pnpm run release:first
+```
+
 ## Notes
 
 - This extension does **not** register the native OpenAI Responses `web_search` tool directly inside Pi.
