@@ -39,7 +39,7 @@
     "extensions": [
       "./src/index.ts"
     ],
-    "image": "https://i.imgur.com/EVZNCaE.png"
+    "image": "https://raw.githubusercontent.com/ayagmar/pi-codex-web-search/master/docs/images/web-search-demo.png"
   },
   "peerDependencies": {
     "@mariozechner/pi-ai": "*",
