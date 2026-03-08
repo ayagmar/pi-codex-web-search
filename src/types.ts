@@ -7,6 +7,7 @@ export interface WebSearchInput {
   query: string;
   maxSources?: number;
   mode?: SearchMode;
+  freshness?: SearchFreshness;
 }
 
 export interface WebSearchSource {
@@ -60,10 +61,15 @@ export interface RunCodexCommandResult {
 
 export type RunCodexCommand = (options: RunCodexCommandOptions) => Promise<RunCodexCommandResult>;
 
+export interface WebSearchTurnState {
+  fastModeExhausted: boolean;
+}
+
 export interface ExecuteCodexWebSearchOptions {
   cwd: string;
   signal?: AbortSignal;
   onUpdate?: AgentToolUpdateCallback<unknown>;
   runner?: RunCodexCommand;
   settings?: WebSearchSettings;
+  turnState?: WebSearchTurnState;
 }

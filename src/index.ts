@@ -20,14 +20,24 @@ import type {
   SearchFreshness,
   SearchMode,
   WebSearchProgressDetails,
+  WebSearchTurnState,
 } from "./types.js";
 
 export default function codexWebSearchExtension(pi: ExtensionAPI) {
+  const turnState: WebSearchTurnState = { fastModeExhausted: false };
+  const resetTurnState = (): void => {
+    turnState.fastModeExhausted = false;
+  };
+
+  pi.on("turn_start", resetTurnState);
+  pi.on("turn_end", resetTurnState);
+  pi.on("agent_end", resetTurnState);
+
   pi.registerTool({
     name: TOOL_NAME,
     label: "Web Search",
     description:
-      "Search the public web through the locally installed Codex CLI and return a concise summary with sources. Use fast mode for quick factual lookups and deep mode only when the user explicitly wants broader research. Defaults are configurable via /web-search-settings. Output is truncated to Pi's standard limits when needed. Requires `codex` to be installed and authenticated on this machine.",
+      "Search the public web through the locally installed Codex CLI and return a concise summary with sources. Use fast mode for quick factual lookups and deep mode only when the user explicitly wants broader research. Freshness can be cached or live, with live preferred for time-sensitive questions. The tool can automatically recover one retryable default fast search by rerunning it as deep/live. Defaults are configurable via /web-search-settings. Output is truncated to Pi's standard limits when needed. Requires `codex` to be installed and authenticated on this machine.",
     parameters: Type.Object({
       query: Type.String({ description: "What to search for on the web" }),
       maxSources: Type.Optional(
@@ -43,11 +53,18 @@ export default function codexWebSearchExtension(pi: ExtensionAPI) {
             "Search depth. Use fast for simple lookups. Use deep only when the user explicitly asks for broader research.",
         })
       ),
+      freshness: Type.Optional(
+        StringEnum(["cached", "live"] as const, {
+          description:
+            "Freshness override. Use live for time-sensitive questions like today, latest, score, result, or weather.",
+        })
+      ),
     }),
     async execute(_toolCallId, params, signal, onUpdate, ctx) {
       const options: ExecuteCodexWebSearchOptions = {
         cwd: ctx.cwd,
         settings: await loadSettings(),
+        turnState,
       };
 
       if (signal) options.signal = signal;
@@ -58,7 +75,7 @@ export default function codexWebSearchExtension(pi: ExtensionAPI) {
     renderCall(args, theme) {
       let text = theme.fg("toolTitle", theme.bold("web_search "));
       text += theme.fg("accent", formatInlineQuery(args.query));
-      text += theme.fg("dim", ` [${args.mode ?? "default"}]`);
+      text += theme.fg("dim", ` [${args.mode ?? "default"}/${args.freshness ?? "auto"}]`);
       if (args.maxSources) {
         text += theme.fg("dim", ` (${args.maxSources} sources max)`);
       }
@@ -70,9 +87,20 @@ export default function codexWebSearchExtension(pi: ExtensionAPI) {
         return new Text(renderProgress(details, expanded, theme), 0, 0);
       }
 
-      const details = result.details as CodexWebSearchDetails | undefined;
-      if (!details) {
-        return new Text(theme.fg("dim", "No web search details available"), 0, 0);
+      const details = result.details as Partial<CodexWebSearchDetails> | undefined;
+      if (!hasRenderableResultDetails(details)) {
+        const content = result.content.find((part) => part.type === "text");
+        if (content?.type === "text" && expanded) {
+          return new Text(
+            `${theme.fg("success", "✓ Web search finished")}\n\n${content.text
+              .split("\n")
+              .map((line) => theme.fg("toolOutput", line))
+              .join("\n")}`,
+            0,
+            0
+          );
+        }
+        return new Text(theme.fg("success", "✓ Web search finished"), 0, 0);
       }
 
       let text = theme.fg(
@@ -301,6 +329,23 @@ function notify(
     return;
   }
   console.log(message);
+}
+
+function hasRenderableResultDetails(
+  details: Partial<CodexWebSearchDetails> | undefined
+): details is CodexWebSearchDetails {
+  return (
+    !!details &&
+    (details.mode === "fast" || details.mode === "deep") &&
+    (details.freshness === "cached" || details.freshness === "live") &&
+    typeof details.query === "string" &&
+    typeof details.sourceCount === "number" &&
+    typeof details.searchCount === "number" &&
+    Array.isArray(details.searchQueries) &&
+    Array.isArray(details.sources) &&
+    typeof details.summary === "string" &&
+    typeof details.truncated === "boolean"
+  );
 }
 
 function renderProgress(

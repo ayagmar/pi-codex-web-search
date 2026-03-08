@@ -7,6 +7,7 @@ import {
   buildCodexPrompt,
   executeCodexWebSearch,
   formatWebSearchResult,
+  isLiveFreshnessQuery,
   normalizeMaxSources,
   normalizeQuery,
   parseCodexWebSearchOutput,
@@ -38,11 +39,39 @@ void test("resolveSearchMode defaults to fast and honors explicit mode overrides
   );
 });
 
-void test("resolveSearchFreshness maps fast and deep to configured freshness", () => {
-  assert.equal(resolveSearchFreshness("fast"), "cached");
-  assert.equal(resolveSearchFreshness("deep"), "live");
-  assert.equal(resolveSearchFreshness("fast", "live", "cached"), "live");
-  assert.equal(resolveSearchFreshness("deep", "cached", "cached"), "cached");
+void test("isLiveFreshnessQuery detects time-sensitive queries", () => {
+  assert.equal(isLiveFreshnessQuery("did sentinels win today"), true);
+  assert.equal(
+    isLiveFreshnessQuery("did sentinels win or lose their valorant game on february 7th"),
+    true
+  );
+  assert.equal(isLiveFreshnessQuery("current tokyo weather"), true);
+  assert.equal(isLiveFreshnessQuery("typescript decorators guide"), false);
+});
+
+void test("resolveSearchFreshness honors explicit overrides and auto-live hints", () => {
+  assert.equal(resolveSearchFreshness({ query: "typescript decorators guide" }, "fast"), "cached");
+  assert.equal(resolveSearchFreshness({ query: "did sentinels win today" }, "fast"), "live");
+  assert.equal(
+    resolveSearchFreshness(
+      { query: "did sentinels win or lose their valorant game on february 7th" },
+      "fast"
+    ),
+    "live"
+  );
+  assert.equal(
+    resolveSearchFreshness({ query: "weather now", freshness: "cached" }, "fast"),
+    "cached"
+  );
+  assert.equal(resolveSearchFreshness({ query: "deep repo comparison" }, "deep"), "live");
+  assert.equal(
+    resolveSearchFreshness({ query: "typescript decorators guide" }, "fast", "live", "cached"),
+    "live"
+  );
+  assert.equal(
+    resolveSearchFreshness({ query: "deep repo comparison" }, "deep", "cached", "cached"),
+    "cached"
+  );
 });
 
 void test("buildCodexPrompt produces a JSON-only research prompt", () => {
@@ -234,6 +263,40 @@ void test("executeCodexWebSearch returns formatted content from codex output", a
   assert.ok(updates.some((line) => line.includes("Search #2: codex exec reference official docs")));
 });
 
+void test("executeCodexWebSearch falls back to the final stdout agent message when the output file is empty", async () => {
+  const runner: RunCodexCommand = ({ args }) => {
+    const outputPath = args[args.indexOf("--output-last-message") + 1];
+    assert.ok(outputPath);
+    return writeFile(outputPath, "   \n").then(() => ({
+      code: 0,
+      stdout: [
+        JSON.stringify({
+          type: "item.completed",
+          item: {
+            type: "agent_message",
+            text: JSON.stringify({
+              summary: "Recovered the final response from stdout.",
+              sources: [],
+            }),
+          },
+        }),
+      ].join("\n"),
+      stderr: "",
+    }));
+  };
+
+  const result = await executeCodexWebSearch(
+    { query: "stdout fallback" },
+    {
+      cwd: process.cwd(),
+      runner,
+    }
+  );
+
+  assert.match(result.content[0]?.text ?? "", /Recovered the final response from stdout\./);
+  assert.equal(result.details.summary, "Recovered the final response from stdout.");
+});
+
 void test("executeCodexWebSearch uses persisted settings for default mode and freshness", async () => {
   const runner: RunCodexCommand = ({ args }) => {
     assert.ok(args.includes('web_search="cached"'));
@@ -263,6 +326,96 @@ void test("executeCodexWebSearch uses persisted settings for default mode and fr
 
   assert.equal(result.details.mode, "deep");
   assert.equal(result.details.freshness, "cached");
+});
+
+void test("executeCodexWebSearch auto-upgrades freshness for current-event queries", async () => {
+  const runner: RunCodexCommand = ({ args }) => {
+    assert.ok(args.includes('web_search="live"'));
+    const outputPath = args[args.indexOf("--output-last-message") + 1];
+    assert.ok(outputPath);
+    return writeFile(
+      outputPath,
+      JSON.stringify({
+        summary: "Sentinels won today.",
+        sources: [],
+      })
+    ).then(() => ({ code: 0, stdout: "", stderr: "" }));
+  };
+
+  const result = await executeCodexWebSearch(
+    { query: "did sentinels win today" },
+    {
+      cwd: process.cwd(),
+      runner,
+    }
+  );
+
+  assert.equal(result.details.mode, "fast");
+  assert.equal(result.details.freshness, "live");
+});
+
+void test("executeCodexWebSearch honors explicit freshness overrides", async () => {
+  const runner: RunCodexCommand = ({ args }) => {
+    assert.ok(args.includes('web_search="cached"'));
+    const outputPath = args[args.indexOf("--output-last-message") + 1];
+    assert.ok(outputPath);
+    return writeFile(
+      outputPath,
+      JSON.stringify({
+        summary: "Tokyo weather summary.",
+        sources: [],
+      })
+    ).then(() => ({ code: 0, stdout: "", stderr: "" }));
+  };
+
+  const result = await executeCodexWebSearch(
+    { query: "weather now in Tokyo", freshness: "cached" },
+    {
+      cwd: process.cwd(),
+      runner,
+    }
+  );
+
+  assert.equal(result.details.freshness, "cached");
+});
+
+void test("executeCodexWebSearch retries default fast searches as deep/live after retryable failures", async () => {
+  const attempts: { args: string[]; stdin: string | undefined }[] = [];
+
+  const runner: RunCodexCommand = ({ args, stdin }) => {
+    attempts.push({ args, stdin });
+
+    if (attempts.length === 1) {
+      return Promise.reject(new Error("Codex web search timed out after 90 seconds."));
+    }
+
+    const outputPath = args[args.indexOf("--output-last-message") + 1];
+    assert.ok(outputPath);
+    return writeFile(
+      outputPath,
+      JSON.stringify({
+        summary: "Recovered on deep/live retry.",
+        sources: [],
+      })
+    ).then(() => ({ code: 0, stdout: "", stderr: "" }));
+  };
+
+  const result = await executeCodexWebSearch(
+    { query: "did sentinels win or lose their valorant game on february 7th" },
+    {
+      cwd: process.cwd(),
+      runner,
+    }
+  );
+
+  assert.equal(attempts.length, 2);
+  assert.ok(attempts[0]?.args.includes('web_search="live"'));
+  assert.ok(attempts[0]?.stdin?.includes("This is a quick lookup."));
+  assert.ok(attempts[1]?.args.includes('web_search="live"'));
+  assert.ok(attempts[1]?.stdin?.includes("This is a deeper research task."));
+  assert.equal(result.details.mode, "deep");
+  assert.equal(result.details.freshness, "live");
+  assert.match(result.content[0]?.text ?? "", /Recovered on deep\/live retry\./);
 });
 
 void test("executeCodexWebSearch rejects blank queries before spawning Codex", async () => {
@@ -318,7 +471,7 @@ void test("executeCodexWebSearch truncates oversized tool output and keeps a tem
 
 void test("executeCodexWebSearch aborts fast mode when Codex exceeds the search budget", async () => {
   const runner: RunCodexCommand = ({ onStdoutLine, signal }) => {
-    for (let i = 1; i <= 7; i += 1) {
+    for (let i = 1; i <= 11; i += 1) {
       onStdoutLine?.(
         JSON.stringify({
           type: "item.completed",
@@ -345,7 +498,7 @@ void test("executeCodexWebSearch aborts fast mode when Codex exceeds the search 
 
   await assert.rejects(
     executeCodexWebSearch(
-      { query: "weather in Tokyo" },
+      { query: "weather in Tokyo", mode: "fast" },
       {
         cwd: process.cwd(),
         runner,
@@ -353,6 +506,29 @@ void test("executeCodexWebSearch aborts fast mode when Codex exceeds the search 
     ),
     /fast search budget/
   );
+});
+
+void test("executeCodexWebSearch blocks repeated fast retries within the same turn", async () => {
+  const turnState = { fastModeExhausted: true };
+  let invoked = false;
+  const runner: RunCodexCommand = () => {
+    invoked = true;
+    return Promise.resolve({ code: 0, stdout: "", stderr: "" });
+  };
+
+  await assert.rejects(
+    executeCodexWebSearch(
+      { query: "did sentinels win today" },
+      {
+        cwd: process.cwd(),
+        runner,
+        turnState,
+      }
+    ),
+    /Do not retry fast mode in the same turn/
+  );
+
+  assert.equal(invoked, false);
 });
 
 void test("executeCodexWebSearch surfaces codex execution failures", async () => {

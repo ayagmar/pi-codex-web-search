@@ -20,6 +20,7 @@ import type {
   CodexWebSearchDetails,
   CodexWebSearchOutput,
   ExecuteCodexWebSearchOptions,
+  RunCodexCommand,
   RunCodexCommandOptions,
   RunCodexCommandResult,
   SearchFreshness,
@@ -27,6 +28,7 @@ import type {
   WebSearchInput,
   WebSearchProgressDetails,
   WebSearchSource,
+  WebSearchTurnState,
 } from "./types.js";
 import { DEFAULT_WEB_SEARCH_SETTINGS } from "./settings.js";
 
@@ -52,6 +54,16 @@ const SEARCH_OUTPUT_SCHEMA = {
   required: ["summary", "sources"],
 } as const;
 
+const LIVE_FRESHNESS_QUERY_PATTERN =
+  /\b(today|latest|current|now|score|result|results|weather|price|status|breaking|live|win|won|lose|lost|game|match|played|standing|schedule)\b/iu;
+
+interface ResolvedWebSearchInput {
+  query: string;
+  maxSources: number;
+  mode: SearchMode;
+  freshness: SearchFreshness;
+}
+
 export function normalizeMaxSources(maxSources?: number): number {
   if (maxSources === undefined) return DEFAULT_MAX_SOURCES;
   const rounded = Math.trunc(maxSources);
@@ -73,12 +85,44 @@ export function resolveSearchMode(
   return input.mode ?? defaultMode;
 }
 
+export function isLiveFreshnessQuery(query: string): boolean {
+  return LIVE_FRESHNESS_QUERY_PATTERN.test(normalizeQuery(query));
+}
+
 export function resolveSearchFreshness(
+  input: WebSearchInput,
   mode: SearchMode,
   fastFreshness = DEFAULT_WEB_SEARCH_SETTINGS.fastFreshness,
   deepFreshness = DEFAULT_WEB_SEARCH_SETTINGS.deepFreshness
 ): SearchFreshness {
+  if (input.freshness) {
+    return input.freshness;
+  }
+
+  if (mode === "fast" && isLiveFreshnessQuery(input.query)) {
+    return "live";
+  }
+
   return mode === "deep" ? deepFreshness : fastFreshness;
+}
+
+function resolveWebSearchInput(
+  input: WebSearchInput,
+  settings = DEFAULT_WEB_SEARCH_SETTINGS
+): ResolvedWebSearchInput {
+  const query = normalizeQuery(input.query);
+  const mode = resolveSearchMode(input, settings.defaultMode);
+  return {
+    query,
+    maxSources: normalizeMaxSources(input.maxSources),
+    mode,
+    freshness: resolveSearchFreshness(
+      { ...input, query },
+      mode,
+      settings.fastFreshness,
+      settings.deepFreshness
+    ),
+  };
 }
 
 export function buildCodexPrompt(input: WebSearchInput): string {
@@ -188,10 +232,42 @@ export async function executeCodexWebSearch(
 }> {
   const runner = options.runner ?? runCodexCommand;
   const settings = options.settings ?? DEFAULT_WEB_SEARCH_SETTINGS;
-  const query = normalizeQuery(input.query);
-  const mode = resolveSearchMode(input, settings.defaultMode);
-  const freshness = resolveSearchFreshness(mode, settings.fastFreshness, settings.deepFreshness);
-  const maxSources = normalizeMaxSources(input.maxSources);
+  const resolvedInput = resolveWebSearchInput(input, settings);
+
+  if (resolvedInput.mode === "fast" && options.turnState?.fastModeExhausted) {
+    throw new Error(
+      "Fast search already failed earlier in this turn. Do not retry fast mode in the same turn; rerun with mode=deep or freshness=live if you need broader or fresher results."
+    );
+  }
+
+  try {
+    return await runResolvedCodexWebSearch(resolvedInput, options, runner);
+  } catch (error) {
+    if (!shouldRetryWithDeepLiveSearch(input, resolvedInput, error)) {
+      throw error;
+    }
+
+    return runResolvedCodexWebSearch(
+      {
+        ...resolvedInput,
+        mode: "deep",
+        freshness: "live",
+      },
+      options,
+      runner
+    );
+  }
+}
+
+async function runResolvedCodexWebSearch(
+  input: ResolvedWebSearchInput,
+  options: ExecuteCodexWebSearchOptions,
+  runner: RunCodexCommand
+): Promise<{
+  content: { type: "text"; text: string }[];
+  details: CodexWebSearchDetails;
+}> {
+  const { query, maxSources, mode, freshness } = input;
   const policy = getSearchPolicy(mode);
   const progress = createSearchProgress(query, mode, freshness);
   const tempDir = await mkdtemp(join(tmpdir(), "pi-codex-web-search-"));
@@ -219,26 +295,41 @@ export async function executeCodexWebSearch(
         }
 
         if (progress.searchCount > policy.queryBudget && !abortController.signal.aborted) {
+          if (mode === "fast") {
+            markFastModeExhausted(options.turnState);
+            abortController.abort(
+              new Error(
+                `Codex exceeded the fast search budget (${policy.queryBudget} queries). Do not retry fast mode again in this turn; rerun with mode=deep or freshness=live if you need broader or fresher results.`
+              )
+            );
+            return;
+          }
+
           abortController.abort(
             new Error(
-              `Codex exceeded the ${mode} search budget (${policy.queryBudget} queries). Ask for a deep search only when you want broader research.`
+              `Codex exceeded the deep search budget (${policy.queryBudget} queries). Narrow the request or make the query more specific.`
             )
           );
         }
       },
     };
 
-    const runResult = await runner(runnerOptions);
+    let runResult: RunCodexCommandResult;
+
+    try {
+      runResult = await runner(runnerOptions);
+    } catch (error) {
+      if (mode === "fast" && shouldBlockFurtherFastRetries(error)) {
+        markFastModeExhausted(options.turnState);
+      }
+      throw error;
+    }
 
     if (runResult.code !== 0) {
       throw new Error(buildCodexFailureMessage(runResult));
     }
 
-    const rawOutput = await readFile(outputPath, "utf-8");
-    if (!rawOutput.trim()) {
-      throw new Error("Codex did not write a final response to the output file.");
-    }
-
+    const rawOutput = await readFinalCodexOutput(outputPath, runResult.stdout);
     const parsed = parseCodexWebSearchOutput(rawOutput, maxSources);
     const formattedResult = formatWebSearchResult(parsed);
     const renderedResult = await renderToolResult(formattedResult);
@@ -270,6 +361,70 @@ export async function executeCodexWebSearch(
   } finally {
     await rm(tempDir, { recursive: true, force: true });
   }
+}
+
+async function readFinalCodexOutput(outputPath: string, stdout: string): Promise<string> {
+  let rawOutput = "";
+
+  try {
+    rawOutput = await readFile(outputPath, "utf-8");
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+      throw error;
+    }
+  }
+
+  if (rawOutput.trim()) {
+    return rawOutput;
+  }
+
+  const fallbackOutput = extractFinalAgentMessage(stdout);
+  if (fallbackOutput) {
+    return fallbackOutput;
+  }
+
+  throw new Error("Codex did not write a final response to the output file or stdout events.");
+}
+
+function extractFinalAgentMessage(stdout: string): string | undefined {
+  let latestAgentMessage: string | undefined;
+
+  for (const line of stdout.split(/\r?\n/u)) {
+    const event = parseJsonObject(line);
+    if (!event || event.type !== "item.completed") continue;
+
+    const item = event.item;
+    if (!item || typeof item !== "object") continue;
+
+    const typedItem = item as { type?: unknown; text?: unknown };
+    if (typedItem.type === "agent_message" && typeof typedItem.text === "string") {
+      latestAgentMessage = typedItem.text;
+    }
+  }
+
+  return latestAgentMessage?.trim() || undefined;
+}
+
+function shouldRetryWithDeepLiveSearch(
+  originalInput: WebSearchInput,
+  resolvedInput: ResolvedWebSearchInput,
+  error: unknown
+): boolean {
+  if (resolvedInput.mode !== "fast") {
+    return false;
+  }
+
+  if (originalInput.mode !== undefined || originalInput.freshness !== undefined) {
+    return false;
+  }
+
+  if (!(error instanceof Error)) {
+    return false;
+  }
+
+  return /timed out|search budget|did not write a final response|invalid JSON|empty summary|does not match the expected web search schema|no result provided/i.test(
+    error.message
+  );
 }
 
 export async function runCodexCommand(
@@ -383,6 +538,20 @@ function tailLines(text: string, count: number): string {
     .filter(Boolean);
 
   return lines.slice(-count).join("\n");
+}
+
+function markFastModeExhausted(turnState: WebSearchTurnState | undefined): void {
+  if (turnState) {
+    turnState.fastModeExhausted = true;
+  }
+}
+
+function shouldBlockFurtherFastRetries(error: unknown): boolean {
+  if (!(error instanceof Error)) {
+    return false;
+  }
+
+  return /search budget|timed out/i.test(error.message);
 }
 
 function getSearchPolicy(mode: SearchMode): { timeoutMs: number; queryBudget: number } {

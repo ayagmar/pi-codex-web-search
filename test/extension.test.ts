@@ -13,6 +13,7 @@ interface CapturedExtension {
 
 function createMockPi(captured: CapturedExtension): ExtensionAPI {
   return {
+    on: () => undefined,
     registerTool: (tool: { name: string; description: string }) => {
       captured.toolName = tool.name;
       captured.toolDescription = tool.description;

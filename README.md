@@ -46,6 +46,12 @@ codex login
 
 ## Install
 
+From npm:
+
+```bash
+pi install npm:pi-codex-web-search
+```
+
 From the repository path:
 
 ```bash
@@ -69,6 +75,7 @@ Parameters:
 - `query: string` — what to search for
 - `maxSources?: number` — optional cap from 1 to 10, default `5`
 - `mode?: "fast" | "deep"` — optional depth override. If omitted, the saved default mode is used.
+- `freshness?: "cached" | "live"` — optional freshness override. Use `live` for time-sensitive questions.
 
 Behavior:
 
@@ -79,7 +86,12 @@ Behavior:
   - fast freshness = `cached`
   - deep freshness = `live`
 - supports explicit `deep` mode for broader research
+- supports explicit `cached`/`live` freshness overrides
+- automatically upgrades fast searches to `live` for freshness-sensitive questions like today, current, latest, sports results, scores, and weather unless you override freshness explicitly
+- automatically retries one retryable default fast search as `deep` + `live` when Codex times out or fails to emit a usable final response
+- falls back to Codex's final JSONL agent message if `--output-last-message` comes back empty
 - enforces smaller time/query budgets in fast mode so lightweight lookups do not run indefinitely
+- blocks repeated fast-mode retries within the same turn after fast mode has already been exhausted
 - shows live search queries and a running search counter in Pi's tool UI
 - supports expanded tool details with `Ctrl+O`
 - returns a compact answer with sources
