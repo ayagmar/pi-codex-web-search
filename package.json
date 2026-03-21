@@ -1,6 +1,6 @@
 {
   "name": "pi-codex-web-search",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "description": "Pi extension that exposes web search through the local Codex CLI",
   "homepage": "https://github.com/ayagmar/pi-codex-web-search",
   "bugs": {
