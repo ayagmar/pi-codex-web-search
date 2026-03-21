@@ -7,7 +7,15 @@ import {
 import { Text } from "@mariozechner/pi-tui";
 import { Type } from "@sinclair/typebox";
 import { executeCodexWebSearch } from "./codex.js";
-import { SETTINGS_COMMAND, TOOL_NAME } from "./constants.js";
+import {
+  MAX_ALLOWED_SOURCES,
+  MAX_QUERY_BUDGET,
+  MAX_TIMEOUT_MS,
+  MIN_QUERY_BUDGET,
+  MIN_TIMEOUT_MS,
+  SETTINGS_COMMAND,
+  TOOL_NAME,
+} from "./constants.js";
 import {
   DEFAULT_WEB_SEARCH_SETTINGS,
   formatSettings,
@@ -16,7 +24,9 @@ import {
 } from "./settings.js";
 import type {
   CodexWebSearchDetails,
+  DefuddleMode,
   ExecuteCodexWebSearchOptions,
+  RetryProvenance,
   SearchFreshness,
   SearchMode,
   WebSearchProgressDetails,
@@ -33,6 +43,18 @@ const SETTINGS_ARGUMENT_OPTIONS = [
   "fast-freshness live",
   "deep-freshness cached",
   "deep-freshness live",
+  "fast-max-sources 5",
+  "deep-max-sources 5",
+  "default-max-sources 5",
+  "defuddle-mode off",
+  "defuddle-mode direct",
+  "defuddle-mode fallback",
+  "defuddle-mode both",
+  "fast-timeout-ms 90000",
+  "deep-timeout-ms 240000",
+  "defuddle-timeout-ms 45000",
+  "fast-query-budget 10",
+  "deep-query-budget 24",
 ] as const;
 
 export default function codexWebSearchExtension(pi: ExtensionAPI) {
@@ -49,14 +71,15 @@ export default function codexWebSearchExtension(pi: ExtensionAPI) {
     name: TOOL_NAME,
     label: "Web Search",
     description:
-      "Search the public web through the locally installed Codex CLI and return a concise summary with sources. Use fast mode for quick factual lookups and deep mode only when the user explicitly wants broader research. Freshness can be cached or live, with live preferred for clearly time-sensitive requests. The tool can automatically recover one retryable default fast search by rerunning it as deep/live and records that retry in the tool details. Defaults are configurable via /web-search-settings. Output is truncated to Pi's standard limits when needed. Requires `codex` to be installed and authenticated on this machine.",
+      "Search the public web through the locally installed Codex CLI and return a concise summary with sources. Use fast mode for quick factual lookups and deep mode only when the user explicitly wants broader research. Freshness can be cached or live, with live preferred for clearly time-sensitive requests. Defuddle can be used for direct URL extraction and optional URL fallback behavior. Timeouts, budgets, Defuddle behavior, and per-mode defaults are configurable via /web-search-settings. Output is truncated to Pi's standard limits when needed. Requires `codex` to be installed and authenticated on this machine.",
     parameters: Type.Object({
       query: Type.String({ description: "What to search for on the web" }),
       maxSources: Type.Optional(
         Type.Integer({
           minimum: 1,
           maximum: 10,
-          description: "Maximum number of sources to include in the result (default: 5)",
+          description:
+            "Maximum number of sources to include in the result. If omitted, the saved fast/deep default is used.",
         })
       ),
       mode: Type.Optional(
@@ -102,14 +125,16 @@ export default function codexWebSearchExtension(pi: ExtensionAPI) {
       const details = result.details as Partial<CodexWebSearchDetails> | undefined;
       if (!hasRenderableResultDetails(details)) {
         const content = result.content.find((part) => part.type === "text");
-        if (content?.type === "text" && expanded) {
-          return new Text(
-            `${theme.fg("success", "✓ Web search finished")}\n\n${formatToolOutput(content.text, theme)}`,
-            0,
-            0
-          );
+        const text = content?.type === "text" ? content.text : "";
+        const failed = looksLikeFailureText(text);
+        const statusLine = failed
+          ? theme.fg("warning", "⚠ Web search failed")
+          : theme.fg("success", "✓ Web search finished");
+
+        if (text && expanded) {
+          return new Text(`${statusLine}\n\n${formatToolOutput(text, theme)}`, 0, 0);
         }
-        return new Text(theme.fg("success", "✓ Web search finished"), 0, 0);
+        return new Text(statusLine, 0, 0);
       }
 
       let text = theme.fg(
@@ -126,7 +151,11 @@ export default function codexWebSearchExtension(pi: ExtensionAPI) {
       }
 
       if (details.retry) {
-        text += theme.fg("warning", " (retried)");
+        text += theme.fg("warning", " (auto-escalated)");
+      }
+
+      if (details.defuddle) {
+        text += theme.fg("warning", " (defuddle)");
       }
 
       if (!expanded) {
@@ -134,13 +163,20 @@ export default function codexWebSearchExtension(pi: ExtensionAPI) {
         if (details.latestQuery) {
           text += `\n${theme.fg("dim", `Last query: ${formatInlineQuery(details.latestQuery, 110)}`)}`;
         }
+        if (details.defuddle?.urls[0]) {
+          text += `\n${theme.fg("dim", `Page: ${formatInlineQuery(details.defuddle.urls[0], 110)}`)}`;
+        }
         return new Text(text, 0, 0);
       }
 
       text += `\n${theme.fg("muted", `Original request: ${details.query}`)}`;
       if (details.retry) {
-        text += `\n${theme.fg("warning", `Retried after ${details.retry.originalMode}/${details.retry.originalFreshness} failed`)}`;
+        text += `\n${theme.fg("warning", formatRetrySummary(details.retry))}`;
         text += `\n${theme.fg("dim", details.retry.fallbackReason)}`;
+      }
+      if (details.defuddle) {
+        text += `\n${theme.fg("warning", details.defuddle.directUrlQuery ? "Used Defuddle for direct URL extraction" : "Used Defuddle after Codex failed")}`;
+        text += `\n${theme.fg("dim", details.defuddle.reason)}`;
       }
       if (details.searchQueries.length > 0) {
         text += `\n${theme.fg("muted", `Queries (${details.searchQueries.length}):`)}`;
@@ -159,7 +195,8 @@ export default function codexWebSearchExtension(pi: ExtensionAPI) {
   });
 
   pi.registerCommand(SETTINGS_COMMAND, {
-    description: "Configure default mode and freshness for the web_search tool",
+    description:
+      "Configure defaults, budgets, timeouts, and Defuddle behavior for the web_search tool",
     getArgumentCompletions: (prefix) => {
       const lowerPrefix = prefix.toLowerCase();
       const matches = SETTINGS_ARGUMENT_OPTIONS.filter((option) => option.startsWith(lowerPrefix));
@@ -219,6 +256,73 @@ async function handleSettingsCommand(args: string, ctx: ExtensionCommandContext)
         return;
       }
 
+      case "fast-max-sources": {
+        const fastMaxSources = parseInteger(value, 1, MAX_ALLOWED_SOURCES, "fast max sources");
+        const saved = await saveSettings({ ...settings, fastMaxSources });
+        notify(ctx, `Fast max sources updated to ${saved.fastMaxSources}.`);
+        return;
+      }
+
+      case "deep-max-sources": {
+        const deepMaxSources = parseInteger(value, 1, MAX_ALLOWED_SOURCES, "deep max sources");
+        const saved = await saveSettings({ ...settings, deepMaxSources });
+        notify(ctx, `Deep max sources updated to ${saved.deepMaxSources}.`);
+        return;
+      }
+
+      case "default-max-sources": {
+        const maxSources = parseInteger(value, 1, MAX_ALLOWED_SOURCES, "default max sources");
+        const saved = await saveSettings({
+          ...settings,
+          fastMaxSources: maxSources,
+          deepMaxSources: maxSources,
+        });
+        notify(ctx, `Fast and deep max sources updated to ${saved.fastMaxSources}.`);
+        return;
+      }
+
+      case "defuddle-mode": {
+        const defuddleMode = parseDefuddleMode(value);
+        const saved = await saveSettings({ ...settings, defuddleMode });
+        notify(ctx, `Defuddle mode updated to ${saved.defuddleMode}.`);
+        return;
+      }
+
+      case "fast-timeout-ms": {
+        const fastTimeoutMs = parseTimeoutMs(value, "fast timeout");
+        const saved = await saveSettings({ ...settings, fastTimeoutMs });
+        notify(ctx, `Fast timeout updated to ${saved.fastTimeoutMs} ms.`);
+        return;
+      }
+
+      case "deep-timeout-ms": {
+        const deepTimeoutMs = parseTimeoutMs(value, "deep timeout");
+        const saved = await saveSettings({ ...settings, deepTimeoutMs });
+        notify(ctx, `Deep timeout updated to ${saved.deepTimeoutMs} ms.`);
+        return;
+      }
+
+      case "defuddle-timeout-ms": {
+        const defuddleTimeoutMs = parseTimeoutMs(value, "Defuddle timeout");
+        const saved = await saveSettings({ ...settings, defuddleTimeoutMs });
+        notify(ctx, `Defuddle timeout updated to ${saved.defuddleTimeoutMs} ms.`);
+        return;
+      }
+
+      case "fast-query-budget": {
+        const fastQueryBudget = parseQueryBudget(value, "fast query budget");
+        const saved = await saveSettings({ ...settings, fastQueryBudget });
+        notify(ctx, `Fast query budget updated to ${saved.fastQueryBudget}.`);
+        return;
+      }
+
+      case "deep-query-budget": {
+        const deepQueryBudget = parseQueryBudget(value, "deep query budget");
+        const saved = await saveSettings({ ...settings, deepQueryBudget });
+        notify(ctx, `Deep query budget updated to ${saved.deepQueryBudget}.`);
+        return;
+      }
+
       default:
         notify(ctx, buildSettingsHelp(settings));
     }
@@ -228,46 +332,237 @@ async function handleSettingsCommand(args: string, ctx: ExtensionCommandContext)
 }
 
 async function openSettingsDialog(ctx: ExtensionCommandContext): Promise<void> {
-  const settings = await loadSettings();
-  const choice = await ctx.ui.select("Web search settings", [
-    "Show current settings",
-    `Default mode: ${settings.defaultMode}`,
-    `Fast freshness: ${settings.fastFreshness}`,
-    `Deep freshness: ${settings.deepFreshness}`,
-    "Reset to defaults",
-  ]);
+  while (true) {
+    const settings = await loadSettings();
+    const choice = await ctx.ui.select(
+      "Web search settings\nChoose a group. Saved values apply when the tool call omits overrides.",
+      [
+        "Show current settings",
+        `Search defaults → mode ${settings.defaultMode}, fast ${settings.fastFreshness}/${settings.fastMaxSources}, deep ${settings.deepFreshness}/${settings.deepMaxSources}`,
+        `Defuddle behavior → ${settings.defuddleMode}`,
+        `Timeouts → fast ${settings.fastTimeoutMs} ms, deep ${settings.deepTimeoutMs} ms, Defuddle ${settings.defuddleTimeoutMs} ms`,
+        `Query budgets → fast ${settings.fastQueryBudget}, deep ${settings.deepQueryBudget}`,
+        "Reset to defaults",
+      ]
+    );
 
-  if (!choice) return;
+    if (!choice) return;
 
-  switch (choice) {
-    case "Show current settings":
+    if (choice === "Show current settings") {
       await handleSettingsCommand("status", ctx);
-      return;
-
-    case `Default mode: ${settings.defaultMode}`: {
-      const mode = await ctx.ui.select("Choose the default mode", ["fast", "deep"]);
-      if (!mode) return;
-      await handleSettingsCommand(`default-mode ${mode}`, ctx);
-      return;
+      continue;
     }
 
-    case `Fast freshness: ${settings.fastFreshness}`: {
-      const freshness = await ctx.ui.select("Choose fast-mode freshness", ["cached", "live"]);
-      if (!freshness) return;
-      await handleSettingsCommand(`fast-freshness ${freshness}`, ctx);
-      return;
+    if (choice.startsWith("Search defaults")) {
+      await openSearchDefaultsDialog(ctx);
+      continue;
     }
 
-    case `Deep freshness: ${settings.deepFreshness}`: {
-      const freshness = await ctx.ui.select("Choose deep-mode freshness", ["cached", "live"]);
-      if (!freshness) return;
-      await handleSettingsCommand(`deep-freshness ${freshness}`, ctx);
-      return;
+    if (choice.startsWith("Defuddle behavior")) {
+      await openDefuddleSettingsDialog(ctx);
+      continue;
     }
 
-    case "Reset to defaults":
+    if (choice.startsWith("Timeouts")) {
+      await openTimeoutSettingsDialog(ctx);
+      continue;
+    }
+
+    if (choice.startsWith("Query budgets")) {
+      await openQueryBudgetSettingsDialog(ctx);
+      continue;
+    }
+
+    if (choice === "Reset to defaults") {
       await handleSettingsCommand("reset", ctx);
-      return;
+    }
+  }
+}
+
+async function openSearchDefaultsDialog(ctx: ExtensionCommandContext): Promise<void> {
+  while (true) {
+    const settings = await loadSettings();
+    const choice = await ctx.ui.select(
+      "Search defaults\nUsed when the tool call omits mode, freshness, or maxSources.",
+      [
+        `Default mode → ${settings.defaultMode}`,
+        `Fast freshness → ${settings.fastFreshness}`,
+        `Deep freshness → ${settings.deepFreshness}`,
+        `Fast max sources → ${settings.fastMaxSources}`,
+        `Deep max sources → ${settings.deepMaxSources}`,
+        "Back",
+      ]
+    );
+
+    if (!choice || choice === "Back") return;
+
+    if (choice.startsWith("Default mode")) {
+      const mode = await ctx.ui.select("Default mode\nUsed when the tool call does not set mode.", [
+        "fast — quick lookup",
+        "deep — broader research",
+      ]);
+      if (!mode) continue;
+      await handleSettingsCommand(`default-mode ${mode.startsWith("deep") ? "deep" : "fast"}`, ctx);
+      continue;
+    }
+
+    if (choice.startsWith("Fast freshness")) {
+      const freshness = await ctx.ui.select(
+        "Fast freshness\nDefault freshness for fast searches when the tool call does not override it.",
+        [
+          "cached — faster and usually enough for stable topics",
+          "live — fresher results for time-sensitive lookups",
+        ]
+      );
+      if (!freshness) continue;
+      await handleSettingsCommand(
+        `fast-freshness ${freshness.startsWith("live") ? "live" : "cached"}`,
+        ctx
+      );
+      continue;
+    }
+
+    if (choice.startsWith("Deep freshness")) {
+      const freshness = await ctx.ui.select(
+        "Deep freshness\nDefault freshness for deep research when the tool call does not override it.",
+        ["cached — use cached search results", "live — prefer the freshest search results"]
+      );
+      if (!freshness) continue;
+      await handleSettingsCommand(
+        `deep-freshness ${freshness.startsWith("live") ? "live" : "cached"}`,
+        ctx
+      );
+      continue;
+    }
+
+    if (choice.startsWith("Fast max sources")) {
+      const value = await ctx.ui.input(
+        "Fast max sources\nDefault source cap for fast mode when the tool call omits maxSources.",
+        String(settings.fastMaxSources)
+      );
+      if (!value) continue;
+      await handleSettingsCommand(`fast-max-sources ${value}`, ctx);
+      continue;
+    }
+
+    if (choice.startsWith("Deep max sources")) {
+      const value = await ctx.ui.input(
+        "Deep max sources\nDefault source cap for deep mode when the tool call omits maxSources.",
+        String(settings.deepMaxSources)
+      );
+      if (!value) continue;
+      await handleSettingsCommand(`deep-max-sources ${value}`, ctx);
+    }
+  }
+}
+
+async function openDefuddleSettingsDialog(ctx: ExtensionCommandContext): Promise<void> {
+  while (true) {
+    const settings = await loadSettings();
+    const choice = await ctx.ui.select(
+      "Defuddle behavior\nControls direct URL extraction and optional single-URL fallback after Codex fails.",
+      [`Mode → ${settings.defuddleMode}`, "Back"]
+    );
+
+    if (!choice || choice === "Back") return;
+
+    const mode = await ctx.ui.select(
+      "Choose the Defuddle mode\nDirect only affects URL-only queries. Fallback stays restricted to single-URL extraction-style requests.",
+      [
+        "off — never use Defuddle",
+        "direct — use Defuddle immediately for URL-only queries",
+        "fallback — only try Defuddle after Codex fails on supported extraction requests",
+        "both — allow direct URL extraction and supported fallback",
+      ]
+    );
+
+    if (!mode) continue;
+
+    const nextMode = mode.startsWith("off")
+      ? "off"
+      : mode.startsWith("direct")
+        ? "direct"
+        : mode.startsWith("fallback")
+          ? "fallback"
+          : "both";
+    await handleSettingsCommand(`defuddle-mode ${nextMode}`, ctx);
+  }
+}
+
+async function openTimeoutSettingsDialog(ctx: ExtensionCommandContext): Promise<void> {
+  while (true) {
+    const settings = await loadSettings();
+    const choice = await ctx.ui.select(
+      "Timeouts\nHow long each backend gets before the run is cancelled.",
+      [
+        `Fast timeout → ${settings.fastTimeoutMs} ms`,
+        `Deep timeout → ${settings.deepTimeoutMs} ms`,
+        `Defuddle timeout → ${settings.defuddleTimeoutMs} ms`,
+        "Back",
+      ]
+    );
+
+    if (!choice || choice === "Back") return;
+
+    if (choice.startsWith("Fast timeout")) {
+      const value = await ctx.ui.input(
+        "Fast timeout (ms)\nShorter limits keep quick lookups snappy.",
+        String(settings.fastTimeoutMs)
+      );
+      if (!value) continue;
+      await handleSettingsCommand(`fast-timeout-ms ${value}`, ctx);
+      continue;
+    }
+
+    if (choice.startsWith("Deep timeout")) {
+      const value = await ctx.ui.input(
+        "Deep timeout (ms)\nLonger limits give Codex more room for broader research.",
+        String(settings.deepTimeoutMs)
+      );
+      if (!value) continue;
+      await handleSettingsCommand(`deep-timeout-ms ${value}`, ctx);
+      continue;
+    }
+
+    const value = await ctx.ui.input(
+      "Defuddle timeout (ms)\nApplies only when Defuddle is used.",
+      String(settings.defuddleTimeoutMs)
+    );
+    if (!value) continue;
+    await handleSettingsCommand(`defuddle-timeout-ms ${value}`, ctx);
+  }
+}
+
+async function openQueryBudgetSettingsDialog(ctx: ExtensionCommandContext): Promise<void> {
+  while (true) {
+    const settings = await loadSettings();
+    const choice = await ctx.ui.select(
+      "Query budgets\nLimits how many distinct web searches Codex can issue per run.",
+      [
+        `Fast query budget → ${settings.fastQueryBudget}`,
+        `Deep query budget → ${settings.deepQueryBudget}`,
+        "Back",
+      ]
+    );
+
+    if (!choice || choice === "Back") return;
+
+    if (choice.startsWith("Fast query budget")) {
+      const value = await ctx.ui.input(
+        "Fast query budget\nFast mode warns near the limit and may auto-escalate once when defaults are in use.",
+        String(settings.fastQueryBudget)
+      );
+      if (!value) continue;
+      await handleSettingsCommand(`fast-query-budget ${value}`, ctx);
+      continue;
+    }
+
+    const value = await ctx.ui.input(
+      "Deep query budget\nIncrease this only when you want deeper Codex research loops.",
+      String(settings.deepQueryBudget)
+    );
+    if (!value) continue;
+    await handleSettingsCommand(`deep-query-budget ${value}`, ctx);
   }
 }
 
@@ -276,11 +571,28 @@ function buildSettingsHelp(settings: WebSearchSettings): string {
     "Current web search settings:",
     formatSettings(settings),
     "",
-    `Commands:`,
-    `/${SETTINGS_COMMAND} status`,
+    "Commands:",
+    "Search defaults:",
     `/${SETTINGS_COMMAND} default-mode <fast|deep>`,
     `/${SETTINGS_COMMAND} fast-freshness <cached|live>`,
     `/${SETTINGS_COMMAND} deep-freshness <cached|live>`,
+    `/${SETTINGS_COMMAND} fast-max-sources <1-${MAX_ALLOWED_SOURCES}>`,
+    `/${SETTINGS_COMMAND} deep-max-sources <1-${MAX_ALLOWED_SOURCES}>`,
+    `/${SETTINGS_COMMAND} default-max-sources <1-${MAX_ALLOWED_SOURCES}>  (legacy alias: sets both)`,
+    "",
+    "Defuddle behavior:",
+    `/${SETTINGS_COMMAND} defuddle-mode <off|direct|fallback|both>`,
+    "",
+    "Timeouts:",
+    `/${SETTINGS_COMMAND} fast-timeout-ms <${MIN_TIMEOUT_MS}-${MAX_TIMEOUT_MS}>`,
+    `/${SETTINGS_COMMAND} deep-timeout-ms <${MIN_TIMEOUT_MS}-${MAX_TIMEOUT_MS}>`,
+    `/${SETTINGS_COMMAND} defuddle-timeout-ms <${MIN_TIMEOUT_MS}-${MAX_TIMEOUT_MS}>`,
+    "",
+    "Query budgets:",
+    `/${SETTINGS_COMMAND} fast-query-budget <${MIN_QUERY_BUDGET}-${MAX_QUERY_BUDGET}>`,
+    `/${SETTINGS_COMMAND} deep-query-budget <${MIN_QUERY_BUDGET}-${MAX_QUERY_BUDGET}>`,
+    "",
+    `/${SETTINGS_COMMAND} status`,
     `/${SETTINGS_COMMAND} reset`,
   ].join("\n");
 }
@@ -306,6 +618,32 @@ function parseFreshness(value: string): SearchFreshness {
     return value;
   }
   throw new Error(`Invalid freshness: ${value}. Expected cached or live.`);
+}
+
+function parseDefuddleMode(value: string): DefuddleMode {
+  if (value === "off" || value === "direct" || value === "fallback" || value === "both") {
+    return value;
+  }
+  throw new Error(`Invalid Defuddle mode: ${value}. Expected off, direct, fallback, or both.`);
+}
+
+function parseTimeoutMs(value: string, label: string): number {
+  return parseInteger(value, MIN_TIMEOUT_MS, MAX_TIMEOUT_MS, label);
+}
+
+function parseQueryBudget(value: string, label: string): number {
+  return parseInteger(value, MIN_QUERY_BUDGET, MAX_QUERY_BUDGET, label);
+}
+
+function parseInteger(value: string, min: number, max: number, label: string): number {
+  const parsed = Number.parseInt(value, 10);
+  if (!Number.isFinite(parsed) || String(parsed) !== value.trim()) {
+    throw new Error(`Invalid ${label}: ${value}. Expected an integer.`);
+  }
+  if (parsed < min || parsed > max) {
+    throw new Error(`Invalid ${label}: ${value}. Expected ${min}-${max}.`);
+  }
+  return parsed;
 }
 
 function notify(
@@ -347,9 +685,12 @@ function renderProgress(
   const searchCount = details?.searchCount ?? 0;
   const mode = details?.mode ?? "fast";
   const freshness = details?.freshness ?? "cached";
-  let text = theme.fg(
-    "warning",
-    `Searching the web [${mode}/${freshness}] · ${searchCount} ${searchCount === 1 ? "query" : "queries"} so far`
+  const statusText = details?.statusText ?? "Searching the web";
+
+  let text = theme.fg("warning", statusText);
+  text += theme.fg(
+    "muted",
+    ` [${mode}/${freshness}] · ${searchCount} ${searchCount === 1 ? "query" : "queries"} so far`
   );
 
   if (!expanded) {
@@ -370,6 +711,24 @@ function renderProgress(
     text += `\n${theme.fg("dim", `  ${index + 1}. ${query}`)}`;
   }
   return text;
+}
+
+function formatRetrySummary(retry: RetryProvenance): string {
+  if (/budget/i.test(retry.fallbackReason)) {
+    return `Auto-escalated to deep/live after fast/${retry.originalFreshness} hit its query budget`;
+  }
+
+  if (/timed out/i.test(retry.fallbackReason)) {
+    return `Auto-escalated to deep/live after fast/${retry.originalFreshness} timed out`;
+  }
+
+  return `Retried as deep/live after fast/${retry.originalFreshness} failed`;
+}
+
+function looksLikeFailureText(text: string): boolean {
+  return /\b(failed|timed out|exceeded|error|could not|invalid|missing|cancelled|authentication)\b/i.test(
+    text
+  );
 }
 
 function formatToolOutput(

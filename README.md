@@ -28,8 +28,10 @@ The extension then:
 - parses Codex JSONL events to show search progress in Pi
 - tracks the actual search queries Codex issued across multiple item event shapes
 - keeps a running search counter in the tool UI
-- uses persisted defaults for mode and freshness unless the tool call overrides them
+- shows clearer in-flight status when fast mode nears its budget or auto-escalates
+- uses persisted defaults for mode, freshness, and per-mode source caps unless the tool call overrides them
 - records when a default fast search had to be retried as deep/live
+- uses Defuddle for direct URL-only requests and supports optional URL fallback when Codex cannot produce a usable result
 - returns a concise summary plus numbered sources with URLs and snippets
 
 ## Requirements
@@ -79,7 +81,7 @@ For hot reload, place the extension in one of Pi's extension folders and run `/r
 Parameters:
 
 - `query: string` — what to search for
-- `maxSources?: number` — optional cap from 1 to 10, default `5`
+- `maxSources?: number` — optional cap from 1 to 10. If omitted, the saved fast/deep default is used for the chosen mode.
 - `mode?: "fast" | "deep"` — optional depth override. If omitted, the saved default mode is used.
 - `freshness?: "cached" | "live"` — optional freshness override. Use `live` for time-sensitive questions.
 
@@ -91,13 +93,18 @@ Behavior:
   - default mode = `fast`
   - fast freshness = `cached`
   - deep freshness = `live`
+  - fast max sources = `5`
+  - deep max sources = `5`
 - supports explicit `deep` mode for broader research
 - supports explicit `cached`/`live` freshness overrides
 - keeps `cached` as the default for normal fast lookups and only auto-promotes to `live` for strong recency cues like `today`, `latest`, `current`, `now`, `weather`, `price`, `breaking`, and `urgent`
-- automatically retries one retryable default fast search as `deep` + `live` when Codex times out or fails to emit a usable final response
-- records that retry in the tool details so Pi can show that the result was recovered after fallback
+- uses Defuddle immediately when the query is just a URL (including `https://defuddle.md/<url>` mirrors) when `defuddle-mode` allows direct extraction
+- automatically retries one retryable default fast search as `deep` + `live` when Codex times out, burns through the fast query budget, or fails to emit a usable final response
+- shows the escalation clearly in tool progress/details when that retry happens
+- can fall back to Defuddle for single-URL extraction-style requests when Codex still fails after its own retries, if `defuddle-mode` enables fallback
 - falls back to Codex's final JSONL agent message if `--output-last-message` comes back empty
 - enforces smaller time/query budgets in fast mode so lightweight lookups do not run indefinitely
+- warns when fast mode has consumed its full query budget and is about to fail or auto-escalate
 - blocks repeated fast-mode retries within the same turn after fast mode has already been exhausted
 - shows live search queries and a running search counter in Pi's tool UI
 - supports expanded tool details with `Ctrl+O`
@@ -114,6 +121,13 @@ Use the slash command below to persist defaults across sessions:
 /web-search-settings
 ```
 
+The interactive dialog is grouped into:
+
+- Search defaults
+- Defuddle behavior
+- Timeouts
+- Query budgets
+
 You can also use direct subcommands:
 
 ```text
@@ -121,10 +135,24 @@ You can also use direct subcommands:
 /web-search-settings default-mode deep
 /web-search-settings fast-freshness cached
 /web-search-settings deep-freshness live
+/web-search-settings fast-max-sources 5
+/web-search-settings deep-max-sources 5
+/web-search-settings default-max-sources 5
+/web-search-settings defuddle-mode direct
+/web-search-settings fast-timeout-ms 90000
+/web-search-settings deep-timeout-ms 240000
+/web-search-settings defuddle-timeout-ms 45000
+/web-search-settings fast-query-budget 10
+/web-search-settings deep-query-budget 24
 /web-search-settings reset
 ```
 
-The settings file is stored under your Pi agent directory and is reused by future sessions.
+Notes:
+
+- `default-max-sources` is kept as a compatibility alias and updates both `fast-max-sources` and `deep-max-sources`.
+- The settings file is stored under your Pi agent directory and is reused by future sessions.
+- Defaults include `defuddle-mode = direct` for URL-only extraction without surprising non-URL search behavior.
+- Timeouts and search-query budgets are configurable for both fast and deep modes.
 
 Note: current Codex docs describe the top-level `web_search` setting as the supported configuration surface. Older legacy settings such as `features.web_search_request` are deprecated.
 

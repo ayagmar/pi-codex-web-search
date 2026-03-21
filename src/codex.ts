@@ -9,17 +9,19 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { MAX_ALLOWED_SOURCES } from "./constants.js";
 import {
-  DEEP_SEARCH_QUERY_BUDGET,
-  DEEP_SEARCH_TIMEOUT_MS,
-  DEFAULT_MAX_SOURCES,
-  FAST_SEARCH_QUERY_BUDGET,
-  FAST_SEARCH_TIMEOUT_MS,
-  MAX_ALLOWED_SOURCES,
-} from "./constants.js";
+  buildDefuddleSnippet,
+  buildDefuddleSummary,
+  extractUrlsFromText,
+  getDirectUrlQuery,
+  runDefuddleCommand,
+} from "./defuddle.js";
+import { DEFAULT_WEB_SEARCH_SETTINGS } from "./settings.js";
 import type {
   CodexWebSearchDetails,
   CodexWebSearchOutput,
+  DefuddleParseResult,
   ExecuteCodexWebSearchOptions,
   RetryProvenance,
   RunCodexCommand,
@@ -29,10 +31,10 @@ import type {
   SearchMode,
   WebSearchInput,
   WebSearchProgressDetails,
+  WebSearchSettings,
   WebSearchSource,
   WebSearchTurnState,
 } from "./types.js";
-import { DEFAULT_WEB_SEARCH_SETTINGS } from "./settings.js";
 
 const SEARCH_OUTPUT_SCHEMA_PATH = fileURLToPath(
   new URL("./search-output-schema.json", import.meta.url)
@@ -48,13 +50,15 @@ interface ResolvedWebSearchInput {
   freshness: SearchFreshness;
 }
 
-export function normalizeMaxSources(maxSources?: number): number {
+export function normalizeMaxSources(
+  maxSources?: number,
+  fallback = DEFAULT_WEB_SEARCH_SETTINGS.fastMaxSources
+): number {
   if (maxSources === undefined || Number.isNaN(maxSources)) {
-    return DEFAULT_MAX_SOURCES;
+    return clampMaxSources(fallback);
   }
 
-  const rounded = Math.trunc(maxSources);
-  return Math.min(Math.max(rounded, 1), MAX_ALLOWED_SOURCES);
+  return clampMaxSources(maxSources);
 }
 
 export function normalizeQuery(query: string): string {
@@ -93,6 +97,10 @@ export function resolveSearchFreshness(
   return mode === "deep" ? deepFreshness : fastFreshness;
 }
 
+function resolveDefaultMaxSources(mode: SearchMode, settings: WebSearchSettings): number {
+  return mode === "deep" ? settings.deepMaxSources : settings.fastMaxSources;
+}
+
 function resolveWebSearchInput(
   input: WebSearchInput,
   settings = DEFAULT_WEB_SEARCH_SETTINGS
@@ -101,7 +109,7 @@ function resolveWebSearchInput(
   const mode = resolveSearchMode(input, settings.defaultMode);
   return {
     query,
-    maxSources: normalizeMaxSources(input.maxSources),
+    maxSources: normalizeMaxSources(input.maxSources, resolveDefaultMaxSources(mode, settings)),
     mode,
     freshness: resolveSearchFreshness(
       { ...input, query },
@@ -110,6 +118,39 @@ function resolveWebSearchInput(
       settings.deepFreshness
     ),
   };
+}
+
+function shouldUseDefuddleForDirectUrl(settings: WebSearchSettings): boolean {
+  return settings.defuddleMode === "direct" || settings.defuddleMode === "both";
+}
+
+function shouldUseDefuddleFallback(
+  settings: WebSearchSettings,
+  query: string,
+  directUrlQuery: boolean
+): boolean {
+  if (directUrlQuery) {
+    return shouldUseDefuddleForDirectUrl(settings);
+  }
+
+  if (settings.defuddleMode !== "fallback" && settings.defuddleMode !== "both") {
+    return false;
+  }
+
+  return getDefuddleFallbackUrls(query).length > 0;
+}
+
+function getDefuddleFallbackUrls(query: string): string[] {
+  const urls = extractUrlsFromText(query);
+  if (urls.length !== 1) {
+    return [];
+  }
+
+  return hasDefuddleExtractionIntent(query) ? urls : [];
+}
+
+function hasDefuddleExtractionIntent(query: string): boolean {
+  return /\b(defuddle|extract|clean|strip|markdown|summari[sz]e)\b/iu.test(query);
 }
 
 export function buildCodexPrompt(input: WebSearchInput): string {
@@ -151,7 +192,7 @@ export function buildCodexExecArgs(
     "exec",
     "--json",
     "-c",
-    `web_search="${freshness}"`,
+    `web_search=\"${freshness}\"`,
     "--skip-git-repo-check",
     "--sandbox",
     "read-only",
@@ -220,6 +261,23 @@ export async function executeCodexWebSearch(
   const runner = options.runner ?? runCodexCommand;
   const settings = options.settings ?? DEFAULT_WEB_SEARCH_SETTINGS;
   const resolvedInput = resolveWebSearchInput(input, settings);
+  const allowFastAutoEscalation = canAutoEscalateDefaultFastSearch(input, resolvedInput);
+
+  const directUrl = shouldUseDefuddleForDirectUrl(settings)
+    ? getDirectUrlQuery(resolvedInput.query)
+    : undefined;
+
+  if (directUrl) {
+    const directResult = await maybeRunDefuddleSearch(resolvedInput, options, settings, {
+      directUrlQuery: true,
+      reason: `Direct URL query: ${directUrl}`,
+      urls: [directUrl],
+    });
+
+    if (directResult) {
+      return directResult;
+    }
+  }
 
   if (resolvedInput.mode === "fast" && options.turnState?.fastModeExhausted) {
     throw new Error(
@@ -228,52 +286,107 @@ export async function executeCodexWebSearch(
   }
 
   try {
-    return await runResolvedCodexWebSearch(resolvedInput, options, runner);
-  } catch (error) {
-    if (!shouldRetryWithDeepLiveSearch(input, resolvedInput, error)) {
-      throw error;
-    }
-
-    const retryError = error as Error;
-
-    return runResolvedCodexWebSearch(
-      {
-        ...resolvedInput,
-        mode: "deep",
-        freshness: "live",
-      },
+    return await runResolvedCodexWebSearch(
+      resolvedInput,
       options,
+      settings,
       runner,
-      {
+      undefined,
+      allowFastAutoEscalation
+    );
+  } catch (error) {
+    if (shouldRetryWithDeepLiveSearch(input, resolvedInput, error)) {
+      const retryReason = errorMessage(error);
+      const retry: RetryProvenance = {
         retriedFromFast: true,
         originalMode: "fast",
         originalFreshness: resolvedInput.freshness,
-        fallbackReason: retryError.message,
+        fallbackReason: retryReason,
+      };
+
+      try {
+        return await runResolvedCodexWebSearch(
+          {
+            ...resolvedInput,
+            mode: "deep",
+            freshness: "live",
+          },
+          options,
+          settings,
+          runner,
+          retry
+        );
+      } catch (retryFailure) {
+        const defuddleRetryFallback = await maybeRunDefuddleSearch(
+          {
+            ...resolvedInput,
+            mode: "deep",
+            freshness: "live",
+          },
+          options,
+          settings,
+          {
+            directUrlQuery: false,
+            reason: errorMessage(retryFailure),
+            retry,
+          }
+        );
+
+        if (defuddleRetryFallback) {
+          return defuddleRetryFallback;
+        }
+
+        throw retryFailure;
       }
-    );
+    }
+
+    const defuddleFallback = await maybeRunDefuddleSearch(resolvedInput, options, settings, {
+      directUrlQuery: false,
+      reason: errorMessage(error),
+    });
+
+    if (defuddleFallback) {
+      return defuddleFallback;
+    }
+
+    throw error;
   }
+}
+
+function canAutoEscalateDefaultFastSearch(
+  originalInput: WebSearchInput,
+  resolvedInput: ResolvedWebSearchInput
+): boolean {
+  if (resolvedInput.mode !== "fast") {
+    return false;
+  }
+
+  return originalInput.mode === undefined && originalInput.freshness === undefined;
 }
 
 async function runResolvedCodexWebSearch(
   input: ResolvedWebSearchInput,
   options: ExecuteCodexWebSearchOptions,
+  settings: WebSearchSettings,
   runner: RunCodexCommand,
-  retry: RetryProvenance | undefined = undefined
+  retry: RetryProvenance | undefined = undefined,
+  allowFastAutoEscalation = false
 ): Promise<{
   content: { type: "text"; text: string }[];
   details: CodexWebSearchDetails;
 }> {
   const { query, maxSources, mode, freshness } = input;
-  const policy = getSearchPolicy(mode);
+  const policy = getSearchPolicy(mode, settings);
   const progress = createSearchProgress(query, mode, freshness);
   const tempDir = await mkdtemp(join(tmpdir(), "pi-codex-web-search-"));
   const outputPath = join(tempDir, "result.json");
+  let warnedAtFastBudget = false;
 
   if (retry) {
     emitProgressUpdate(
       options,
       progress,
-      `Retrying as ${mode}/${freshness} after fast/${retry.originalFreshness} failed: ${retry.fallbackReason}`
+      buildFastRetryStatus(mode, freshness, retry.fallbackReason)
     );
   }
 
@@ -290,9 +403,28 @@ async function runResolvedCodexWebSearch(
       timeoutMs: policy.timeoutMs,
       signal,
       onStdoutLine: (line) => {
+        const previousSearchCount = progress.searchCount;
         const updates = collectSearchQueries(progress, line);
         for (const addedQuery of updates) {
           emitProgressUpdate(options, progress, `Search #${progress.searchCount}: ${addedQuery}`);
+        }
+
+        if (
+          mode === "fast" &&
+          previousSearchCount < policy.queryBudget &&
+          progress.searchCount >= policy.queryBudget &&
+          !warnedAtFastBudget
+        ) {
+          warnedAtFastBudget = true;
+          emitProgressUpdate(
+            options,
+            progress,
+            buildFastBudgetWarning(
+              progress.searchCount,
+              policy.queryBudget,
+              allowFastAutoEscalation
+            )
+          );
         }
 
         if (progress.searchCount > policy.queryBudget && !abortController.signal.aborted) {
@@ -300,7 +432,11 @@ async function runResolvedCodexWebSearch(
             markFastModeExhausted(options.turnState);
             abortController.abort(
               new Error(
-                `Codex exceeded the fast search budget (${policy.queryBudget} queries). Do not retry fast mode again in this turn; rerun with mode=deep or freshness=live if you need broader or fresher results.`
+                buildFastBudgetFailure(
+                  progress.searchCount,
+                  policy.queryBudget,
+                  allowFastAutoEscalation
+                )
               )
             );
             return;
@@ -308,7 +444,7 @@ async function runResolvedCodexWebSearch(
 
           abortController.abort(
             new Error(
-              `Codex exceeded the deep search budget (${policy.queryBudget} queries). Narrow the request or make the query more specific.`
+              `Codex exceeded the deep search budget (${progress.searchCount}/${policy.queryBudget} queries). Narrow the request or make the query more specific.`
             )
           );
         }
@@ -368,6 +504,138 @@ async function runResolvedCodexWebSearch(
   }
 }
 
+function buildFastRetryStatus(
+  mode: SearchMode,
+  freshness: SearchFreshness,
+  reason: string
+): string {
+  const action = /budget/i.test(reason)
+    ? `Auto-escalating to ${mode}/${freshness} after fast mode hit its query budget.`
+    : `Retrying as ${mode}/${freshness} after fast mode failed.`;
+  return `${action} ${reason}`;
+}
+
+function buildFastBudgetWarning(
+  searchCount: number,
+  queryBudget: number,
+  allowFastAutoEscalation: boolean
+): string {
+  if (allowFastAutoEscalation) {
+    return `Fast mode has used its full query budget (${searchCount}/${queryBudget}). If Codex needs another search, it will auto-escalate once to deep/live.`;
+  }
+
+  return `Fast mode has used its full query budget (${searchCount}/${queryBudget}). If Codex needs another search, this run will fail. Rerun with mode=deep or freshness=live for a broader search.`;
+}
+
+function buildFastBudgetFailure(
+  searchCount: number,
+  queryBudget: number,
+  allowFastAutoEscalation: boolean
+): string {
+  if (allowFastAutoEscalation) {
+    return `Fast mode exhausted its query budget (${searchCount}/${queryBudget} queries). Auto-escalating once to deep/live.`;
+  }
+
+  return `Codex exceeded the fast search budget (${searchCount}/${queryBudget} queries). Do not retry fast mode again in this turn; rerun with mode=deep or freshness=live if you need broader or fresher results.`;
+}
+
+async function maybeRunDefuddleSearch(
+  input: ResolvedWebSearchInput,
+  options: ExecuteCodexWebSearchOptions,
+  settings: WebSearchSettings,
+  defuddle: {
+    directUrlQuery: boolean;
+    reason: string;
+    urls?: string[];
+    retry?: RetryProvenance;
+  }
+): Promise<
+  | {
+      content: { type: "text"; text: string }[];
+      details: CodexWebSearchDetails;
+    }
+  | undefined
+> {
+  if (!shouldUseDefuddleFallback(settings, input.query, defuddle.directUrlQuery)) {
+    return undefined;
+  }
+
+  const defuddleRunner = options.defuddleRunner ?? runDefuddleCommand;
+  const urls = (defuddle.urls ?? getDefuddleFallbackUrls(input.query)).slice(0, input.maxSources);
+  if (urls.length === 0) {
+    return undefined;
+  }
+
+  const progress = createSearchProgress(input.query, input.mode, input.freshness);
+  const results: DefuddleParseResult[] = [];
+
+  for (const url of urls) {
+    emitProgressUpdate(options, progress, `Extracting clean page content with Defuddle: ${url}`);
+
+    try {
+      const runnerOptions = {
+        url,
+        cwd: options.cwd,
+      } as const;
+
+      const parsed = options.signal
+        ? await defuddleRunner({
+            ...runnerOptions,
+            signal: options.signal,
+            timeoutMs: settings.defuddleTimeoutMs,
+          })
+        : await defuddleRunner({ ...runnerOptions, timeoutMs: settings.defuddleTimeoutMs });
+      results.push(parsed);
+    } catch (error) {
+      if (options.signal?.aborted || isAbortLikeError(error)) {
+        throw error;
+      }
+      continue;
+    }
+  }
+
+  if (results.length === 0) {
+    return undefined;
+  }
+
+  const sources = results.map((result) => ({
+    title: result.title.trim() || result.url,
+    url: result.url,
+    snippet: buildDefuddleSnippet(result),
+  }));
+  const summary = buildDefuddleSummary(results, defuddle);
+  const renderedResult = await renderToolResult(formatWebSearchResult({ summary, sources }));
+  const details: CodexWebSearchDetails = {
+    query: input.query,
+    mode: input.mode,
+    freshness: input.freshness,
+    searchCount: 0,
+    searchQueries: [],
+    sourceCount: sources.length,
+    summary,
+    sources,
+    truncated: renderedResult.truncated,
+    defuddle: {
+      directUrlQuery: defuddle.directUrlQuery,
+      reason: defuddle.reason,
+      urls: results.map((result) => result.url),
+    },
+  };
+
+  if (defuddle.retry) {
+    details.retry = defuddle.retry;
+  }
+
+  if (renderedResult.fullOutputPath) {
+    details.fullOutputPath = renderedResult.fullOutputPath;
+  }
+
+  return {
+    content: [{ type: "text", text: renderedResult.text }],
+    details,
+  };
+}
+
 async function readFinalCodexOutput(outputPath: string, stdout: string): Promise<string> {
   let rawOutput = "";
 
@@ -410,6 +678,10 @@ function extractFinalAgentMessage(stdout: string): string | undefined {
   return latestAgentMessage?.trim() || undefined;
 }
 
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
 function shouldRetryWithDeepLiveSearch(
   originalInput: WebSearchInput,
   resolvedInput: ResolvedWebSearchInput,
@@ -427,7 +699,7 @@ function shouldRetryWithDeepLiveSearch(
     return false;
   }
 
-  return /timed out|search budget|did not write a final response|invalid JSON|empty summary|does not match the expected web search schema|no result provided/i.test(
+  return /timed out|query budget|search budget|did not write a final response|invalid JSON|empty summary|does not match the expected web search schema|no result provided/i.test(
     error.message
   );
 }
@@ -565,20 +837,23 @@ function shouldBlockFurtherFastRetries(error: unknown): boolean {
     return false;
   }
 
-  return /search budget|timed out/i.test(error.message);
+  return /query budget|search budget|timed out/i.test(error.message);
 }
 
-function getSearchPolicy(mode: SearchMode): { timeoutMs: number; queryBudget: number } {
+function getSearchPolicy(
+  mode: SearchMode,
+  settings: WebSearchSettings
+): { timeoutMs: number; queryBudget: number } {
   if (mode === "deep") {
     return {
-      timeoutMs: DEEP_SEARCH_TIMEOUT_MS,
-      queryBudget: DEEP_SEARCH_QUERY_BUDGET,
+      timeoutMs: settings.deepTimeoutMs,
+      queryBudget: settings.deepQueryBudget,
     };
   }
 
   return {
-    timeoutMs: FAST_SEARCH_TIMEOUT_MS,
-    queryBudget: FAST_SEARCH_QUERY_BUDGET,
+    timeoutMs: settings.fastTimeoutMs,
+    queryBudget: settings.fastQueryBudget,
   };
 }
 
@@ -601,12 +876,15 @@ function emitProgressUpdate(
   progress: WebSearchProgressDetails,
   text: string
 ): void {
+  progress.statusText = text;
+
   const details: WebSearchProgressDetails = {
     query: progress.query,
     mode: progress.mode,
     freshness: progress.freshness,
     searchCount: progress.searchCount,
     searchQueries: [...progress.searchQueries],
+    statusText: progress.statusText,
   };
 
   if (progress.latestQuery) {
@@ -648,14 +926,37 @@ function collectSearchQueries(progress: WebSearchProgressDetails, line: string):
   const addedQueries: string[] = [];
   for (const query of queries) {
     const normalized = query.trim();
-    if (!normalized || progress.searchQueries.includes(normalized)) continue;
-    progress.searchQueries.push(normalized);
-    progress.searchCount = progress.searchQueries.length;
+    if (!normalized) continue;
+
+    progress.searchCount += 1;
     progress.latestQuery = normalized;
+
+    if (progress.searchQueries.includes(normalized)) {
+      continue;
+    }
+
+    progress.searchQueries.push(normalized);
     addedQueries.push(normalized);
   }
 
   return addedQueries;
+}
+
+function clampMaxSources(value: number): number {
+  if (!Number.isFinite(value)) {
+    return 1;
+  }
+
+  const rounded = Math.trunc(value);
+  return Math.min(Math.max(rounded, 1), MAX_ALLOWED_SOURCES);
+}
+
+function isAbortLikeError(error: unknown): boolean {
+  if (typeof DOMException !== "undefined" && error instanceof DOMException) {
+    return error.name === "AbortError";
+  }
+
+  return error instanceof Error && error.name === "AbortError";
 }
 
 async function renderToolResult(text: string): Promise<{
@@ -727,7 +1028,7 @@ function extractSearchQueries(event: Record<string, unknown>): string[] {
     ...extractSearchActionQueries(typedItem.output),
   ];
 
-  return queries;
+  return dedupeQueries(queries);
 }
 
 function extractSearchActionQueries(value: unknown): string[] {
@@ -753,6 +1054,20 @@ function extractQueryValues(value: unknown): string[] {
   }
 
   return value.filter((query): query is string => typeof query === "string");
+}
+
+function dedupeQueries(queries: string[]): string[] {
+  const uniqueQueries: string[] = [];
+
+  for (const query of queries) {
+    const normalized = query.trim();
+    if (!normalized || uniqueQueries.includes(normalized)) {
+      continue;
+    }
+    uniqueQueries.push(normalized);
+  }
+
+  return uniqueQueries;
 }
 
 function isCodexWebSearchOutput(value: unknown): value is CodexWebSearchOutput {
