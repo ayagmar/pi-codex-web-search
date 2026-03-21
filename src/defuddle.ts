@@ -34,7 +34,13 @@ export function extractUrlsFromText(text: string): string[] {
 }
 
 export function getDirectUrlQuery(query: string): string | undefined {
-  const matches = query.match(URL_PATTERN) ?? [];
+  const trimmedQuery = query.trim();
+  const unwrappedQuery =
+    trimmedQuery.startsWith("<") && trimmedQuery.endsWith(">")
+      ? trimmedQuery.slice(1, -1).trim()
+      : trimmedQuery;
+
+  const matches = unwrappedQuery.match(URL_PATTERN) ?? [];
   if (matches.length !== 1) {
     return undefined;
   }
@@ -49,7 +55,7 @@ export function getDirectUrlQuery(query: string): string | undefined {
     return undefined;
   }
 
-  const remainder = query.replace(rawUrl, " ").trim();
+  const remainder = unwrappedQuery.replace(rawUrl, " ").trim();
   return remainder ? undefined : directUrl;
 }
 
@@ -242,7 +248,45 @@ function unwrapDefuddleUrl(url: string): string {
 }
 
 function trimTrailingPunctuation(value: string): string {
-  return value.replace(/[\s),.;:!?]+$/u, "");
+  let trimmed = value.trim();
+
+  if (trimmed.startsWith("<") && trimmed.endsWith(">")) {
+    trimmed = trimmed.slice(1, -1).trim();
+  }
+
+  let removableClosingParens = Math.max(
+    countCharacters(trimmed, ")") - countCharacters(trimmed, "("),
+    0
+  );
+
+  while (trimmed.length > 0) {
+    const lastCharacter = trimmed.at(-1);
+    if (!lastCharacter) {
+      break;
+    }
+
+    if (lastCharacter === ")") {
+      if (removableClosingParens === 0) {
+        break;
+      }
+      trimmed = trimmed.slice(0, -1);
+      removableClosingParens -= 1;
+      continue;
+    }
+
+    if (/[\s,.;:!?>]/u.test(lastCharacter)) {
+      trimmed = trimmed.slice(0, -1);
+      continue;
+    }
+
+    break;
+  }
+
+  return trimmed;
+}
+
+function countCharacters(value: string, character: string): number {
+  return [...value].filter((candidate) => candidate === character).length;
 }
 
 function extractPreview(content: string, maxLength: number): string {

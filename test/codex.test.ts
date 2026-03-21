@@ -41,6 +41,15 @@ void test("extractUrlsFromText unwraps defuddle mirror URLs and deduplicates mat
   );
 });
 
+void test("extractUrlsFromText preserves balanced parentheses and strips angle brackets", () => {
+  assert.deepEqual(
+    extractUrlsFromText(
+      "Read <https://en.wikipedia.org/wiki/Function_(mathematics)> and https://example.com/test)."
+    ),
+    ["https://en.wikipedia.org/wiki/Function_(mathematics)", "https://example.com/test"]
+  );
+});
+
 void test("getDirectUrlQuery only matches URL-only requests", () => {
   assert.equal(
     getDirectUrlQuery("https://developers.openai.com/codex/cli/features"),
@@ -50,6 +59,7 @@ void test("getDirectUrlQuery only matches URL-only requests", () => {
     getDirectUrlQuery("https://defuddle.md/https://developers.openai.com/codex/cli/features"),
     "https://developers.openai.com/codex/cli/features"
   );
+  assert.equal(getDirectUrlQuery("<https://example.com/test>"), "https://example.com/test");
   assert.equal(
     getDirectUrlQuery("summarize https://developers.openai.com/codex/cli/features"),
     undefined
@@ -422,8 +432,14 @@ void test("executeCodexWebSearch falls back to Defuddle for URL-based requests w
     }
   );
 
-  assert.equal(result.details.mode, "fast");
-  assert.equal(result.details.freshness, "cached");
+  assert.equal(result.details.mode, "deep");
+  assert.equal(result.details.freshness, "live");
+  assert.deepEqual(result.details.retry, {
+    retriedFromFast: true,
+    originalMode: "fast",
+    originalFreshness: "cached",
+    fallbackReason: "Codex web search timed out after 90 seconds.",
+  });
   assert.equal(result.details.defuddle?.directUrlQuery, false);
   assert.equal(result.details.defuddle?.reason, "Codex web search timed out after 90 seconds.");
   assert.match(result.details.summary, /Codex did not produce a usable response/);
@@ -628,6 +644,63 @@ void test("executeCodexWebSearch retries default fast searches as deep/live afte
     fallbackReason: "Codex web search timed out after 90 seconds.",
   });
   assert.match(result.content[0]?.text ?? "", /Recovered on deep\/live retry\./);
+});
+
+void test("executeCodexWebSearch keeps retry provenance when Defuddle handles a failed deep/live retry", async () => {
+  let attempts = 0;
+
+  const runner: RunCodexCommand = () => {
+    attempts += 1;
+
+    if (attempts === 1) {
+      return Promise.reject(new Error("Codex web search timed out after 90 seconds."));
+    }
+
+    return Promise.reject(
+      new Error("Codex did not write a final response to the output file or stdout events.")
+    );
+  };
+
+  const defuddleRunner: RunDefuddleCommand = ({ url }) => {
+    assert.equal(url, "https://developers.openai.com/codex/cli/features");
+    return Promise.resolve({
+      url,
+      title: "Features – Codex CLI | OpenAI Developers",
+      description: "Overview of functionality in the Codex terminal client",
+      domain: "developers.openai.com",
+      author: "",
+      published: "",
+      wordCount: 1234,
+      content: "Codex supports workflows beyond chat.",
+    });
+  };
+
+  const result = await executeCodexWebSearch(
+    { query: "summarize https://developers.openai.com/codex/cli/features" },
+    {
+      cwd: process.cwd(),
+      runner,
+      defuddleRunner,
+      settings: {
+        ...DEFAULT_WEB_SEARCH_SETTINGS,
+        defuddleMode: "both",
+      },
+    }
+  );
+
+  assert.equal(attempts, 2);
+  assert.equal(result.details.mode, "deep");
+  assert.equal(result.details.freshness, "live");
+  assert.deepEqual(result.details.retry, {
+    retriedFromFast: true,
+    originalMode: "fast",
+    originalFreshness: "cached",
+    fallbackReason: "Codex web search timed out after 90 seconds.",
+  });
+  assert.equal(
+    result.details.defuddle?.reason,
+    "Codex did not write a final response to the output file or stdout events."
+  );
 });
 
 void test("executeCodexWebSearch auto-escalates default fast searches after budget exhaustion", async () => {

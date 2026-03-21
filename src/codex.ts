@@ -298,6 +298,12 @@ export async function executeCodexWebSearch(
   } catch (error) {
     if (shouldRetryWithDeepLiveSearch(input, resolvedInput, error)) {
       const retryReason = errorMessage(error);
+      const retry: RetryProvenance = {
+        retriedFromFast: true,
+        originalMode: "fast",
+        originalFreshness: resolvedInput.freshness,
+        fallbackReason: retryReason,
+      };
 
       try {
         return await runResolvedCodexWebSearch(
@@ -309,21 +315,21 @@ export async function executeCodexWebSearch(
           options,
           settings,
           runner,
-          {
-            retriedFromFast: true,
-            originalMode: "fast",
-            originalFreshness: resolvedInput.freshness,
-            fallbackReason: retryReason,
-          }
+          retry
         );
       } catch (retryFailure) {
         const defuddleRetryFallback = await maybeRunDefuddleSearch(
-          resolvedInput,
+          {
+            ...resolvedInput,
+            mode: "deep",
+            freshness: "live",
+          },
           options,
           settings,
           {
             directUrlQuery: false,
             reason: errorMessage(retryFailure),
+            retry,
           }
         );
 
@@ -518,6 +524,7 @@ async function maybeRunDefuddleSearch(
     directUrlQuery: boolean;
     reason: string;
     urls?: string[];
+    retry?: RetryProvenance;
   }
 ): Promise<
   | {
@@ -588,6 +595,10 @@ async function maybeRunDefuddleSearch(
       urls: results.map((result) => result.url),
     },
   };
+
+  if (defuddle.retry) {
+    details.retry = defuddle.retry;
+  }
 
   if (renderedResult.fullOutputPath) {
     details.fullOutputPath = renderedResult.fullOutputPath;
