@@ -66,5 +66,8 @@
   "license": "MIT",
   "engines": {
     "node": ">=22"
+  },
+  "dependencies": {
+    "defuddle": "0.14.0"
   }
 }

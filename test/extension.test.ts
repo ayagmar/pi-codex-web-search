@@ -32,5 +32,8 @@ void test("extension registers the web_search tool and settings command", () => 
   assert.equal(captured.toolName, TOOL_NAME);
   assert.match(captured.toolDescription ?? "", /Codex CLI/);
   assert.equal(captured.commandName, SETTINGS_COMMAND);
-  assert.match(captured.commandDescription ?? "", /default mode and freshness/);
+  assert.match(
+    captured.commandDescription ?? "",
+    /defaults, budgets, timeouts, and Defuddle behavior/
+  );
 });

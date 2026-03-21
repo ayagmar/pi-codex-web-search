@@ -2,6 +2,7 @@ import type { AgentToolUpdateCallback } from "@mariozechner/pi-coding-agent";
 
 export type SearchMode = "fast" | "deep";
 export type SearchFreshness = "cached" | "live";
+export type DefuddleMode = "off" | "direct" | "fallback" | "both";
 
 export interface WebSearchInput {
   query: string;
@@ -28,6 +29,7 @@ export interface WebSearchProgressDetails {
   searchCount: number;
   searchQueries: string[];
   latestQuery?: string;
+  statusText?: string;
 }
 
 export interface RetryProvenance {
@@ -37,6 +39,12 @@ export interface RetryProvenance {
   fallbackReason: string;
 }
 
+export interface DefuddleProvenance {
+  directUrlQuery: boolean;
+  reason: string;
+  urls: string[];
+}
+
 export interface CodexWebSearchDetails extends WebSearchProgressDetails {
   sourceCount: number;
   summary: string;
@@ -44,12 +52,21 @@ export interface CodexWebSearchDetails extends WebSearchProgressDetails {
   truncated: boolean;
   fullOutputPath?: string;
   retry?: RetryProvenance;
+  defuddle?: DefuddleProvenance;
 }
 
 export interface WebSearchSettings {
   defaultMode: SearchMode;
   fastFreshness: SearchFreshness;
   deepFreshness: SearchFreshness;
+  fastMaxSources: number;
+  deepMaxSources: number;
+  defuddleMode: DefuddleMode;
+  fastTimeoutMs: number;
+  deepTimeoutMs: number;
+  defuddleTimeoutMs: number;
+  fastQueryBudget: number;
+  deepQueryBudget: number;
 }
 
 export interface RunCodexCommandOptions {
@@ -69,6 +86,28 @@ export interface RunCodexCommandResult {
 
 export type RunCodexCommand = (options: RunCodexCommandOptions) => Promise<RunCodexCommandResult>;
 
+export interface RunDefuddleCommandOptions {
+  url: string;
+  cwd: string;
+  signal?: AbortSignal;
+  timeoutMs?: number;
+}
+
+export interface DefuddleParseResult {
+  url: string;
+  title: string;
+  description: string;
+  domain: string;
+  author: string;
+  published: string;
+  wordCount: number;
+  content: string;
+}
+
+export type RunDefuddleCommand = (
+  options: RunDefuddleCommandOptions
+) => Promise<DefuddleParseResult>;
+
 export interface WebSearchTurnState {
   fastModeExhausted: boolean;
 }
@@ -78,6 +117,7 @@ export interface ExecuteCodexWebSearchOptions {
   signal?: AbortSignal;
   onUpdate?: AgentToolUpdateCallback<unknown>;
   runner?: RunCodexCommand;
+  defuddleRunner?: RunDefuddleCommand;
   settings?: WebSearchSettings;
   turnState?: WebSearchTurnState;
 }

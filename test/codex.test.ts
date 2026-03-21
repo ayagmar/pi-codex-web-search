@@ -14,12 +14,14 @@ import {
   resolveSearchFreshness,
   resolveSearchMode,
 } from "../src/codex.js";
-import { DEFAULT_MAX_SOURCES, MAX_ALLOWED_SOURCES } from "../src/constants.js";
-import type { RunCodexCommand } from "../src/types.js";
+import { extractUrlsFromText, getDirectUrlQuery } from "../src/defuddle.js";
+import { DEFAULT_FAST_MAX_SOURCES, MAX_ALLOWED_SOURCES } from "../src/constants.js";
+import { DEFAULT_WEB_SEARCH_SETTINGS } from "../src/settings.js";
+import type { RunCodexCommand, RunDefuddleCommand } from "../src/types.js";
 
 void test("normalizeMaxSources clamps values into the supported range", () => {
-  assert.equal(normalizeMaxSources(undefined), DEFAULT_MAX_SOURCES);
-  assert.equal(normalizeMaxSources(Number.NaN), DEFAULT_MAX_SOURCES);
+  assert.equal(normalizeMaxSources(undefined), DEFAULT_FAST_MAX_SOURCES);
+  assert.equal(normalizeMaxSources(Number.NaN), DEFAULT_FAST_MAX_SOURCES);
   assert.equal(normalizeMaxSources(0), 1);
   assert.equal(normalizeMaxSources(3.9), 3);
   assert.equal(normalizeMaxSources(999), MAX_ALLOWED_SOURCES);
@@ -28,6 +30,30 @@ void test("normalizeMaxSources clamps values into the supported range", () => {
 void test("normalizeQuery trims input and rejects blank queries", () => {
   assert.equal(normalizeQuery("  latest codex cli release  "), "latest codex cli release");
   assert.throws(() => normalizeQuery("   \n\t  "), /non-empty query/);
+});
+
+void test("extractUrlsFromText unwraps defuddle mirror URLs and deduplicates matches", () => {
+  assert.deepEqual(
+    extractUrlsFromText(
+      "See https://defuddle.md/https://developers.openai.com/codex/cli/features and https://developers.openai.com/codex/cli/features"
+    ),
+    ["https://developers.openai.com/codex/cli/features"]
+  );
+});
+
+void test("getDirectUrlQuery only matches URL-only requests", () => {
+  assert.equal(
+    getDirectUrlQuery("https://developers.openai.com/codex/cli/features"),
+    "https://developers.openai.com/codex/cli/features"
+  );
+  assert.equal(
+    getDirectUrlQuery("https://defuddle.md/https://developers.openai.com/codex/cli/features"),
+    "https://developers.openai.com/codex/cli/features"
+  );
+  assert.equal(
+    getDirectUrlQuery("summarize https://developers.openai.com/codex/cli/features"),
+    undefined
+  );
 });
 
 void test("resolveSearchMode defaults to fast and honors explicit mode overrides", () => {
@@ -184,6 +210,7 @@ void test("formatWebSearchResult renders summary followed by numbered sources", 
 
 void test("executeCodexWebSearch returns formatted content from codex output", async () => {
   const updates: string[] = [];
+  const statusTexts: string[] = [];
 
   const runner: RunCodexCommand = ({ args, stdin, onStdoutLine }) => {
     assert.ok(stdin?.includes("User query: pi extension web search"));
@@ -243,6 +270,8 @@ void test("executeCodexWebSearch returns formatted content from codex output", a
       onUpdate: (update) => {
         const first = update.content[0];
         updates.push(first?.type === "text" ? first.text : "");
+        const details = update.details as { statusText?: string } | undefined;
+        statusTexts.push(details?.statusText ?? "");
       },
     }
   );
@@ -263,6 +292,180 @@ void test("executeCodexWebSearch returns formatted content from codex output", a
     updates.some((line) => line.includes("Search #1: developers.openai.com codex cli reference"))
   );
   assert.ok(updates.some((line) => line.includes("Search #2: codex exec reference official docs")));
+  assert.ok(
+    statusTexts.some((line) => line.includes("Search #2: codex exec reference official docs"))
+  );
+});
+
+void test("executeCodexWebSearch uses mode-specific default maxSources unless explicitly overridden", async () => {
+  const prompts: string[] = [];
+
+  const runner: RunCodexCommand = ({ args, stdin }) => {
+    prompts.push(stdin ?? "");
+    const outputPath = args[args.indexOf("--output-last-message") + 1];
+    assert.ok(outputPath);
+    return writeFile(
+      outputPath,
+      JSON.stringify({
+        summary: "Mode-specific source caps were applied.",
+        sources: [],
+      })
+    ).then(() => ({ code: 0, stdout: "", stderr: "" }));
+  };
+
+  const settings = {
+    ...DEFAULT_WEB_SEARCH_SETTINGS,
+    fastMaxSources: 2,
+    deepMaxSources: 7,
+  };
+
+  await executeCodexWebSearch(
+    { query: "fast default max sources" },
+    {
+      cwd: process.cwd(),
+      runner,
+      settings,
+    }
+  );
+
+  await executeCodexWebSearch(
+    { query: "deep default max sources", mode: "deep" },
+    {
+      cwd: process.cwd(),
+      runner,
+      settings,
+    }
+  );
+
+  await executeCodexWebSearch(
+    { query: "explicit override", mode: "deep", maxSources: 4 },
+    {
+      cwd: process.cwd(),
+      runner,
+      settings,
+    }
+  );
+
+  assert.match(prompts[0] ?? "", /at most 2 items/i);
+  assert.match(prompts[1] ?? "", /at most 7 items/i);
+  assert.match(prompts[2] ?? "", /at most 4 items/i);
+});
+
+void test("executeCodexWebSearch uses Defuddle directly for URL-only queries", async () => {
+  let codexInvoked = false;
+  const runner: RunCodexCommand = () => {
+    codexInvoked = true;
+    return Promise.resolve({ code: 0, stdout: "", stderr: "" });
+  };
+
+  const defuddleRunner: RunDefuddleCommand = ({ url }) => {
+    assert.equal(url, "https://developers.openai.com/codex/cli/features");
+    return Promise.resolve({
+      url,
+      title: "Features – Codex CLI | OpenAI Developers",
+      description: "Overview of functionality in the Codex terminal client",
+      domain: "developers.openai.com",
+      author: "",
+      published: "",
+      wordCount: 1234,
+      content: "Codex supports workflows beyond chat.",
+    });
+  };
+
+  const result = await executeCodexWebSearch(
+    { query: "https://defuddle.md/https://developers.openai.com/codex/cli/features" },
+    {
+      cwd: process.cwd(),
+      runner,
+      defuddleRunner,
+    }
+  );
+
+  assert.equal(codexInvoked, false);
+  assert.equal(result.details.searchCount, 0);
+  assert.equal(result.details.defuddle?.directUrlQuery, true);
+  assert.deepEqual(result.details.defuddle?.urls, [
+    "https://developers.openai.com/codex/cli/features",
+  ]);
+  assert.match(result.details.summary, /Defuddle extracted clean content directly/);
+  assert.equal(result.details.sources[0]?.title, "Features – Codex CLI | OpenAI Developers");
+});
+
+void test("executeCodexWebSearch falls back to Defuddle for URL-based requests when Codex fails", async () => {
+  const runner: RunCodexCommand = () =>
+    Promise.reject(new Error("Codex web search timed out after 90 seconds."));
+
+  const defuddleRunner: RunDefuddleCommand = ({ url }) => {
+    assert.equal(url, "https://developers.openai.com/codex/cli/features");
+    return Promise.resolve({
+      url,
+      title: "Features – Codex CLI | OpenAI Developers",
+      description: "Overview of functionality in the Codex terminal client",
+      domain: "developers.openai.com",
+      author: "",
+      published: "",
+      wordCount: 1234,
+      content: "Codex supports workflows beyond chat.",
+    });
+  };
+
+  const result = await executeCodexWebSearch(
+    { query: "summarize https://developers.openai.com/codex/cli/features" },
+    {
+      cwd: process.cwd(),
+      runner,
+      defuddleRunner,
+      settings: {
+        ...DEFAULT_WEB_SEARCH_SETTINGS,
+        defuddleMode: "both",
+      },
+    }
+  );
+
+  assert.equal(result.details.mode, "fast");
+  assert.equal(result.details.freshness, "cached");
+  assert.equal(result.details.defuddle?.directUrlQuery, false);
+  assert.equal(result.details.defuddle?.reason, "Codex web search timed out after 90 seconds.");
+  assert.match(result.details.summary, /Codex did not produce a usable response/);
+  assert.equal(result.details.sources[0]?.url, "https://developers.openai.com/codex/cli/features");
+});
+
+void test("executeCodexWebSearch does not use Defuddle fallback for generic URL queries", async () => {
+  const runner: RunCodexCommand = () =>
+    Promise.reject(new Error("Codex web search timed out after 90 seconds."));
+
+  let defuddleInvoked = false;
+  const defuddleRunner: RunDefuddleCommand = () => {
+    defuddleInvoked = true;
+    return Promise.resolve({
+      url: "https://developers.openai.com/codex/cli/features",
+      title: "Features – Codex CLI | OpenAI Developers",
+      description: "Overview of functionality in the Codex terminal client",
+      domain: "developers.openai.com",
+      author: "",
+      published: "",
+      wordCount: 1234,
+      content: "Codex supports workflows beyond chat.",
+    });
+  };
+
+  await assert.rejects(
+    executeCodexWebSearch(
+      { query: "compare this page https://developers.openai.com/codex/cli/features" },
+      {
+        cwd: process.cwd(),
+        runner,
+        defuddleRunner,
+        settings: {
+          ...DEFAULT_WEB_SEARCH_SETTINGS,
+          defuddleMode: "both",
+        },
+      }
+    ),
+    /timed out/
+  );
+
+  assert.equal(defuddleInvoked, false);
 });
 
 void test("executeCodexWebSearch falls back to the final stdout agent message when the output file is empty", async () => {
@@ -319,6 +522,7 @@ void test("executeCodexWebSearch uses persisted settings for default mode and fr
       cwd: process.cwd(),
       runner,
       settings: {
+        ...DEFAULT_WEB_SEARCH_SETTINGS,
         defaultMode: "deep",
         fastFreshness: "live",
         deepFreshness: "cached",
@@ -426,6 +630,77 @@ void test("executeCodexWebSearch retries default fast searches as deep/live afte
   assert.match(result.content[0]?.text ?? "", /Recovered on deep\/live retry\./);
 });
 
+void test("executeCodexWebSearch auto-escalates default fast searches after budget exhaustion", async () => {
+  const statusTexts: string[] = [];
+  let attempts = 0;
+
+  const runner: RunCodexCommand = ({ args, onStdoutLine, signal }) => {
+    attempts += 1;
+
+    if (attempts === 1) {
+      for (let i = 1; i <= 11; i += 1) {
+        onStdoutLine?.(
+          JSON.stringify({
+            type: "item.completed",
+            item: {
+              type: "web_search",
+              action: {
+                type: "search",
+                query: `query ${i}`,
+                queries: [`query ${i}`],
+              },
+            },
+          })
+        );
+        if (signal?.aborted) break;
+      }
+
+      const reason: unknown = signal?.reason;
+      return Promise.reject(
+        reason instanceof Error
+          ? reason
+          : new Error(typeof reason === "string" ? reason : "expected abort")
+      );
+    }
+
+    const outputPath = args[args.indexOf("--output-last-message") + 1];
+    assert.ok(outputPath);
+    return writeFile(
+      outputPath,
+      JSON.stringify({
+        summary: "Recovered after fast-mode budget exhaustion.",
+        sources: [],
+      })
+    ).then(() => ({ code: 0, stdout: "", stderr: "" }));
+  };
+
+  const result = await executeCodexWebSearch(
+    { query: "budget-heavy fast search" },
+    {
+      cwd: process.cwd(),
+      runner,
+      onUpdate: (update) => {
+        const details = update.details as { statusText?: string } | undefined;
+        statusTexts.push(details?.statusText ?? "");
+      },
+    }
+  );
+
+  assert.equal(attempts, 2);
+  assert.equal(result.details.mode, "deep");
+  assert.equal(result.details.freshness, "live");
+  assert.match(result.details.retry?.fallbackReason ?? "", /Auto-escalating once to deep\/live/);
+  assert.ok(
+    statusTexts.some((line) => line.includes("Fast mode has used its full query budget (10/10)"))
+  );
+  assert.ok(
+    statusTexts.some((line) =>
+      line.includes("Auto-escalating to deep/live after fast mode hit its query budget")
+    )
+  );
+  assert.match(result.content[0]?.text ?? "", /Recovered after fast-mode budget exhaustion\./);
+});
+
 void test("executeCodexWebSearch rejects blank queries before spawning Codex", async () => {
   let invoked = false;
   const runner: RunCodexCommand = () => {
@@ -518,7 +793,7 @@ void test("executeCodexWebSearch allows runs that use the full fast search budge
   assert.match(result.content[0]?.text ?? "", /Completed at the fast search budget\./);
 });
 
-void test("executeCodexWebSearch aborts fast mode when Codex exceeds the search budget", async () => {
+void test("executeCodexWebSearch aborts explicit fast mode when Codex exceeds the search budget", async () => {
   const runner: RunCodexCommand = ({ onStdoutLine, signal }) => {
     for (let i = 1; i <= 11; i += 1) {
       onStdoutLine?.(

@@ -9,17 +9,19 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { MAX_ALLOWED_SOURCES } from "./constants.js";
 import {
-  DEEP_SEARCH_QUERY_BUDGET,
-  DEEP_SEARCH_TIMEOUT_MS,
-  DEFAULT_MAX_SOURCES,
-  FAST_SEARCH_QUERY_BUDGET,
-  FAST_SEARCH_TIMEOUT_MS,
-  MAX_ALLOWED_SOURCES,
-} from "./constants.js";
+  buildDefuddleSnippet,
+  buildDefuddleSummary,
+  extractUrlsFromText,
+  getDirectUrlQuery,
+  runDefuddleCommand,
+} from "./defuddle.js";
+import { DEFAULT_WEB_SEARCH_SETTINGS } from "./settings.js";
 import type {
   CodexWebSearchDetails,
   CodexWebSearchOutput,
+  DefuddleParseResult,
   ExecuteCodexWebSearchOptions,
   RetryProvenance,
   RunCodexCommand,
@@ -29,10 +31,10 @@ import type {
   SearchMode,
   WebSearchInput,
   WebSearchProgressDetails,
+  WebSearchSettings,
   WebSearchSource,
   WebSearchTurnState,
 } from "./types.js";
-import { DEFAULT_WEB_SEARCH_SETTINGS } from "./settings.js";
 
 const SEARCH_OUTPUT_SCHEMA_PATH = fileURLToPath(
   new URL("./search-output-schema.json", import.meta.url)
@@ -48,9 +50,12 @@ interface ResolvedWebSearchInput {
   freshness: SearchFreshness;
 }
 
-export function normalizeMaxSources(maxSources?: number): number {
+export function normalizeMaxSources(
+  maxSources?: number,
+  fallback = DEFAULT_WEB_SEARCH_SETTINGS.fastMaxSources
+): number {
   if (maxSources === undefined || Number.isNaN(maxSources)) {
-    return DEFAULT_MAX_SOURCES;
+    return fallback;
   }
 
   const rounded = Math.trunc(maxSources);
@@ -93,6 +98,10 @@ export function resolveSearchFreshness(
   return mode === "deep" ? deepFreshness : fastFreshness;
 }
 
+function resolveDefaultMaxSources(mode: SearchMode, settings: WebSearchSettings): number {
+  return mode === "deep" ? settings.deepMaxSources : settings.fastMaxSources;
+}
+
 function resolveWebSearchInput(
   input: WebSearchInput,
   settings = DEFAULT_WEB_SEARCH_SETTINGS
@@ -101,7 +110,7 @@ function resolveWebSearchInput(
   const mode = resolveSearchMode(input, settings.defaultMode);
   return {
     query,
-    maxSources: normalizeMaxSources(input.maxSources),
+    maxSources: normalizeMaxSources(input.maxSources, resolveDefaultMaxSources(mode, settings)),
     mode,
     freshness: resolveSearchFreshness(
       { ...input, query },
@@ -110,6 +119,39 @@ function resolveWebSearchInput(
       settings.deepFreshness
     ),
   };
+}
+
+function shouldUseDefuddleForDirectUrl(settings: WebSearchSettings): boolean {
+  return settings.defuddleMode === "direct" || settings.defuddleMode === "both";
+}
+
+function shouldUseDefuddleFallback(
+  settings: WebSearchSettings,
+  query: string,
+  directUrlQuery: boolean
+): boolean {
+  if (directUrlQuery) {
+    return shouldUseDefuddleForDirectUrl(settings);
+  }
+
+  if (settings.defuddleMode !== "fallback" && settings.defuddleMode !== "both") {
+    return false;
+  }
+
+  return getDefuddleFallbackUrls(query).length > 0;
+}
+
+function getDefuddleFallbackUrls(query: string): string[] {
+  const urls = extractUrlsFromText(query);
+  if (urls.length !== 1) {
+    return [];
+  }
+
+  return hasDefuddleExtractionIntent(query) ? urls : [];
+}
+
+function hasDefuddleExtractionIntent(query: string): boolean {
+  return /\b(defuddle|extract|clean|strip|markdown|summari[sz]e)\b/iu.test(query);
 }
 
 export function buildCodexPrompt(input: WebSearchInput): string {
@@ -151,7 +193,7 @@ export function buildCodexExecArgs(
     "exec",
     "--json",
     "-c",
-    `web_search="${freshness}"`,
+    `web_search=\"${freshness}\"`,
     "--skip-git-repo-check",
     "--sandbox",
     "read-only",
@@ -220,6 +262,23 @@ export async function executeCodexWebSearch(
   const runner = options.runner ?? runCodexCommand;
   const settings = options.settings ?? DEFAULT_WEB_SEARCH_SETTINGS;
   const resolvedInput = resolveWebSearchInput(input, settings);
+  const allowFastAutoEscalation = canAutoEscalateDefaultFastSearch(input, resolvedInput);
+
+  const directUrl = shouldUseDefuddleForDirectUrl(settings)
+    ? getDirectUrlQuery(resolvedInput.query)
+    : undefined;
+
+  if (directUrl) {
+    const directResult = await maybeRunDefuddleSearch(resolvedInput, options, settings, {
+      directUrlQuery: true,
+      reason: `Direct URL query: ${directUrl}`,
+      urls: [directUrl],
+    });
+
+    if (directResult) {
+      return directResult;
+    }
+  }
 
   if (resolvedInput.mode === "fast" && options.turnState?.fastModeExhausted) {
     throw new Error(
@@ -228,52 +287,101 @@ export async function executeCodexWebSearch(
   }
 
   try {
-    return await runResolvedCodexWebSearch(resolvedInput, options, runner);
+    return await runResolvedCodexWebSearch(
+      resolvedInput,
+      options,
+      settings,
+      runner,
+      undefined,
+      allowFastAutoEscalation
+    );
   } catch (error) {
-    if (!shouldRetryWithDeepLiveSearch(input, resolvedInput, error)) {
-      throw error;
+    if (shouldRetryWithDeepLiveSearch(input, resolvedInput, error)) {
+      const retryReason = errorMessage(error);
+
+      try {
+        return await runResolvedCodexWebSearch(
+          {
+            ...resolvedInput,
+            mode: "deep",
+            freshness: "live",
+          },
+          options,
+          settings,
+          runner,
+          {
+            retriedFromFast: true,
+            originalMode: "fast",
+            originalFreshness: resolvedInput.freshness,
+            fallbackReason: retryReason,
+          }
+        );
+      } catch (retryFailure) {
+        const defuddleRetryFallback = await maybeRunDefuddleSearch(
+          resolvedInput,
+          options,
+          settings,
+          {
+            directUrlQuery: false,
+            reason: errorMessage(retryFailure),
+          }
+        );
+
+        if (defuddleRetryFallback) {
+          return defuddleRetryFallback;
+        }
+
+        throw retryFailure;
+      }
     }
 
-    const retryError = error as Error;
+    const defuddleFallback = await maybeRunDefuddleSearch(resolvedInput, options, settings, {
+      directUrlQuery: false,
+      reason: errorMessage(error),
+    });
 
-    return runResolvedCodexWebSearch(
-      {
-        ...resolvedInput,
-        mode: "deep",
-        freshness: "live",
-      },
-      options,
-      runner,
-      {
-        retriedFromFast: true,
-        originalMode: "fast",
-        originalFreshness: resolvedInput.freshness,
-        fallbackReason: retryError.message,
-      }
-    );
+    if (defuddleFallback) {
+      return defuddleFallback;
+    }
+
+    throw error;
   }
+}
+
+function canAutoEscalateDefaultFastSearch(
+  originalInput: WebSearchInput,
+  resolvedInput: ResolvedWebSearchInput
+): boolean {
+  if (resolvedInput.mode !== "fast") {
+    return false;
+  }
+
+  return originalInput.mode === undefined && originalInput.freshness === undefined;
 }
 
 async function runResolvedCodexWebSearch(
   input: ResolvedWebSearchInput,
   options: ExecuteCodexWebSearchOptions,
+  settings: WebSearchSettings,
   runner: RunCodexCommand,
-  retry: RetryProvenance | undefined = undefined
+  retry: RetryProvenance | undefined = undefined,
+  allowFastAutoEscalation = false
 ): Promise<{
   content: { type: "text"; text: string }[];
   details: CodexWebSearchDetails;
 }> {
   const { query, maxSources, mode, freshness } = input;
-  const policy = getSearchPolicy(mode);
+  const policy = getSearchPolicy(mode, settings);
   const progress = createSearchProgress(query, mode, freshness);
   const tempDir = await mkdtemp(join(tmpdir(), "pi-codex-web-search-"));
   const outputPath = join(tempDir, "result.json");
+  let warnedAtFastBudget = false;
 
   if (retry) {
     emitProgressUpdate(
       options,
       progress,
-      `Retrying as ${mode}/${freshness} after fast/${retry.originalFreshness} failed: ${retry.fallbackReason}`
+      buildFastRetryStatus(mode, freshness, retry.fallbackReason)
     );
   }
 
@@ -295,13 +403,20 @@ async function runResolvedCodexWebSearch(
           emitProgressUpdate(options, progress, `Search #${progress.searchCount}: ${addedQuery}`);
         }
 
+        if (mode === "fast" && progress.searchCount === policy.queryBudget && !warnedAtFastBudget) {
+          warnedAtFastBudget = true;
+          emitProgressUpdate(
+            options,
+            progress,
+            buildFastBudgetWarning(policy.queryBudget, allowFastAutoEscalation)
+          );
+        }
+
         if (progress.searchCount > policy.queryBudget && !abortController.signal.aborted) {
           if (mode === "fast") {
             markFastModeExhausted(options.turnState);
             abortController.abort(
-              new Error(
-                `Codex exceeded the fast search budget (${policy.queryBudget} queries). Do not retry fast mode again in this turn; rerun with mode=deep or freshness=live if you need broader or fresher results.`
-              )
+              new Error(buildFastBudgetFailure(policy.queryBudget, allowFastAutoEscalation))
             );
             return;
           }
@@ -368,6 +483,122 @@ async function runResolvedCodexWebSearch(
   }
 }
 
+function buildFastRetryStatus(
+  mode: SearchMode,
+  freshness: SearchFreshness,
+  reason: string
+): string {
+  const action = /budget/i.test(reason)
+    ? `Auto-escalating to ${mode}/${freshness} after fast mode hit its query budget.`
+    : `Retrying as ${mode}/${freshness} after fast mode failed.`;
+  return `${action} ${reason}`;
+}
+
+function buildFastBudgetWarning(queryBudget: number, allowFastAutoEscalation: boolean): string {
+  if (allowFastAutoEscalation) {
+    return `Fast mode has used its full query budget (${queryBudget}/${queryBudget}). If Codex needs another search, it will auto-escalate once to deep/live.`;
+  }
+
+  return `Fast mode has used its full query budget (${queryBudget}/${queryBudget}). If Codex needs another search, this run will fail. Rerun with mode=deep or freshness=live for a broader search.`;
+}
+
+function buildFastBudgetFailure(queryBudget: number, allowFastAutoEscalation: boolean): string {
+  if (allowFastAutoEscalation) {
+    return `Fast mode exhausted its query budget (${queryBudget} queries). Auto-escalating once to deep/live.`;
+  }
+
+  return `Codex exceeded the fast search budget (${queryBudget} queries). Do not retry fast mode again in this turn; rerun with mode=deep or freshness=live if you need broader or fresher results.`;
+}
+
+async function maybeRunDefuddleSearch(
+  input: ResolvedWebSearchInput,
+  options: ExecuteCodexWebSearchOptions,
+  settings: WebSearchSettings,
+  defuddle: {
+    directUrlQuery: boolean;
+    reason: string;
+    urls?: string[];
+  }
+): Promise<
+  | {
+      content: { type: "text"; text: string }[];
+      details: CodexWebSearchDetails;
+    }
+  | undefined
+> {
+  if (!shouldUseDefuddleFallback(settings, input.query, defuddle.directUrlQuery)) {
+    return undefined;
+  }
+
+  const defuddleRunner = options.defuddleRunner ?? runDefuddleCommand;
+  const urls = (defuddle.urls ?? getDefuddleFallbackUrls(input.query)).slice(0, input.maxSources);
+  if (urls.length === 0) {
+    return undefined;
+  }
+
+  const progress = createSearchProgress(input.query, input.mode, input.freshness);
+  const results: DefuddleParseResult[] = [];
+
+  for (const url of urls) {
+    emitProgressUpdate(options, progress, `Extracting clean page content with Defuddle: ${url}`);
+
+    try {
+      const runnerOptions = {
+        url,
+        cwd: options.cwd,
+      } as const;
+
+      const parsed = options.signal
+        ? await defuddleRunner({
+            ...runnerOptions,
+            signal: options.signal,
+            timeoutMs: settings.defuddleTimeoutMs,
+          })
+        : await defuddleRunner({ ...runnerOptions, timeoutMs: settings.defuddleTimeoutMs });
+      results.push(parsed);
+    } catch {
+      continue;
+    }
+  }
+
+  if (results.length === 0) {
+    return undefined;
+  }
+
+  const sources = results.map((result) => ({
+    title: result.title.trim() || result.url,
+    url: result.url,
+    snippet: buildDefuddleSnippet(result),
+  }));
+  const summary = buildDefuddleSummary(results, defuddle);
+  const renderedResult = await renderToolResult(formatWebSearchResult({ summary, sources }));
+  const details: CodexWebSearchDetails = {
+    query: input.query,
+    mode: input.mode,
+    freshness: input.freshness,
+    searchCount: 0,
+    searchQueries: [],
+    sourceCount: sources.length,
+    summary,
+    sources,
+    truncated: renderedResult.truncated,
+    defuddle: {
+      directUrlQuery: defuddle.directUrlQuery,
+      reason: defuddle.reason,
+      urls: results.map((result) => result.url),
+    },
+  };
+
+  if (renderedResult.fullOutputPath) {
+    details.fullOutputPath = renderedResult.fullOutputPath;
+  }
+
+  return {
+    content: [{ type: "text", text: renderedResult.text }],
+    details,
+  };
+}
+
 async function readFinalCodexOutput(outputPath: string, stdout: string): Promise<string> {
   let rawOutput = "";
 
@@ -410,6 +641,10 @@ function extractFinalAgentMessage(stdout: string): string | undefined {
   return latestAgentMessage?.trim() || undefined;
 }
 
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
 function shouldRetryWithDeepLiveSearch(
   originalInput: WebSearchInput,
   resolvedInput: ResolvedWebSearchInput,
@@ -427,7 +662,7 @@ function shouldRetryWithDeepLiveSearch(
     return false;
   }
 
-  return /timed out|search budget|did not write a final response|invalid JSON|empty summary|does not match the expected web search schema|no result provided/i.test(
+  return /timed out|query budget|search budget|did not write a final response|invalid JSON|empty summary|does not match the expected web search schema|no result provided/i.test(
     error.message
   );
 }
@@ -565,20 +800,23 @@ function shouldBlockFurtherFastRetries(error: unknown): boolean {
     return false;
   }
 
-  return /search budget|timed out/i.test(error.message);
+  return /query budget|search budget|timed out/i.test(error.message);
 }
 
-function getSearchPolicy(mode: SearchMode): { timeoutMs: number; queryBudget: number } {
+function getSearchPolicy(
+  mode: SearchMode,
+  settings: WebSearchSettings
+): { timeoutMs: number; queryBudget: number } {
   if (mode === "deep") {
     return {
-      timeoutMs: DEEP_SEARCH_TIMEOUT_MS,
-      queryBudget: DEEP_SEARCH_QUERY_BUDGET,
+      timeoutMs: settings.deepTimeoutMs,
+      queryBudget: settings.deepQueryBudget,
     };
   }
 
   return {
-    timeoutMs: FAST_SEARCH_TIMEOUT_MS,
-    queryBudget: FAST_SEARCH_QUERY_BUDGET,
+    timeoutMs: settings.fastTimeoutMs,
+    queryBudget: settings.fastQueryBudget,
   };
 }
 
@@ -601,12 +839,15 @@ function emitProgressUpdate(
   progress: WebSearchProgressDetails,
   text: string
 ): void {
+  progress.statusText = text;
+
   const details: WebSearchProgressDetails = {
     query: progress.query,
     mode: progress.mode,
     freshness: progress.freshness,
     searchCount: progress.searchCount,
     searchQueries: [...progress.searchQueries],
+    statusText: progress.statusText,
   };
 
   if (progress.latestQuery) {
