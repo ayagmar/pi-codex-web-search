@@ -19,6 +19,7 @@ import type { RunCodexCommand } from "../src/types.js";
 
 void test("normalizeMaxSources clamps values into the supported range", () => {
   assert.equal(normalizeMaxSources(undefined), DEFAULT_MAX_SOURCES);
+  assert.equal(normalizeMaxSources(Number.NaN), DEFAULT_MAX_SOURCES);
   assert.equal(normalizeMaxSources(0), 1);
   assert.equal(normalizeMaxSources(3.9), 3);
   assert.equal(normalizeMaxSources(999), MAX_ALLOWED_SOURCES);
@@ -39,13 +40,14 @@ void test("resolveSearchMode defaults to fast and honors explicit mode overrides
   );
 });
 
-void test("isLiveFreshnessQuery detects time-sensitive queries", () => {
+void test("isLiveFreshnessQuery detects strong recency signals", () => {
   assert.equal(isLiveFreshnessQuery("did sentinels win today"), true);
+  assert.equal(isLiveFreshnessQuery("current tokyo weather"), true);
+  assert.equal(isLiveFreshnessQuery("team standings and schedule"), false);
   assert.equal(
     isLiveFreshnessQuery("did sentinels win or lose their valorant game on february 7th"),
-    true
+    false
   );
-  assert.equal(isLiveFreshnessQuery("current tokyo weather"), true);
   assert.equal(isLiveFreshnessQuery("typescript decorators guide"), false);
 });
 
@@ -57,7 +59,7 @@ void test("resolveSearchFreshness honors explicit overrides and auto-live hints"
       { query: "did sentinels win or lose their valorant game on february 7th" },
       "fast"
     ),
-    "live"
+    "cached"
   );
   assert.equal(
     resolveSearchFreshness({ query: "weather now", freshness: "cached" }, "fast"),
@@ -188,9 +190,9 @@ void test("executeCodexWebSearch returns formatted content from codex output", a
 
     onStdoutLine?.(
       JSON.stringify({
-        type: "item.completed",
+        type: "item.started",
         item: {
-          type: "web_search",
+          type: "web_search_call",
           action: {
             type: "search",
             query: "developers.openai.com codex cli reference",
@@ -409,12 +411,18 @@ void test("executeCodexWebSearch retries default fast searches as deep/live afte
   );
 
   assert.equal(attempts.length, 2);
-  assert.ok(attempts[0]?.args.includes('web_search="live"'));
+  assert.ok(attempts[0]?.args.includes('web_search="cached"'));
   assert.ok(attempts[0]?.stdin?.includes("This is a quick lookup."));
   assert.ok(attempts[1]?.args.includes('web_search="live"'));
   assert.ok(attempts[1]?.stdin?.includes("This is a deeper research task."));
   assert.equal(result.details.mode, "deep");
   assert.equal(result.details.freshness, "live");
+  assert.deepEqual(result.details.retry, {
+    retriedFromFast: true,
+    originalMode: "fast",
+    originalFreshness: "cached",
+    fallbackReason: "Codex web search timed out after 90 seconds.",
+  });
   assert.match(result.content[0]?.text ?? "", /Recovered on deep\/live retry\./);
 });
 
@@ -467,6 +475,47 @@ void test("executeCodexWebSearch truncates oversized tool output and keeps a tem
   if (result.details.fullOutputPath) {
     await rm(dirname(result.details.fullOutputPath), { recursive: true, force: true });
   }
+});
+
+void test("executeCodexWebSearch allows runs that use the full fast search budget", async () => {
+  const runner: RunCodexCommand = ({ args, onStdoutLine }) => {
+    for (let i = 1; i <= 10; i += 1) {
+      onStdoutLine?.(
+        JSON.stringify({
+          type: "item.completed",
+          item: {
+            type: "web_search",
+            action: {
+              type: "search",
+              query: `query ${i}`,
+              queries: [`query ${i}`],
+            },
+          },
+        })
+      );
+    }
+
+    const outputPath = args[args.indexOf("--output-last-message") + 1];
+    assert.ok(outputPath);
+    return writeFile(
+      outputPath,
+      JSON.stringify({
+        summary: "Completed at the fast search budget.",
+        sources: [],
+      })
+    ).then(() => ({ code: 0, stdout: "", stderr: "" }));
+  };
+
+  const result = await executeCodexWebSearch(
+    { query: "weather in Tokyo", mode: "fast" },
+    {
+      cwd: process.cwd(),
+      runner,
+    }
+  );
+
+  assert.equal(result.details.searchCount, 10);
+  assert.match(result.content[0]?.text ?? "", /Completed at the fast search budget\./);
 });
 
 void test("executeCodexWebSearch aborts fast mode when Codex exceeds the search budget", async () => {
@@ -547,6 +596,6 @@ void test("executeCodexWebSearch surfaces codex execution failures", async () =>
         runner,
       }
     ),
-    /codex exec failed with exit code 7[\s\S]*authentication required/
+    /codex exec failed with exit code 7[\s\S]*authentication required[\s\S]*codex login status[\s\S]*codex login/
   );
 });
