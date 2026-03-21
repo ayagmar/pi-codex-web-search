@@ -8,6 +8,7 @@ import {
 } from "@mariozechner/pi-coding-agent";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import {
   DEEP_SEARCH_QUERY_BUDGET,
   DEEP_SEARCH_TIMEOUT_MS,
@@ -20,6 +21,7 @@ import type {
   CodexWebSearchDetails,
   CodexWebSearchOutput,
   ExecuteCodexWebSearchOptions,
+  RetryProvenance,
   RunCodexCommand,
   RunCodexCommandOptions,
   RunCodexCommandResult,
@@ -32,30 +34,12 @@ import type {
 } from "./types.js";
 import { DEFAULT_WEB_SEARCH_SETTINGS } from "./settings.js";
 
-const SEARCH_OUTPUT_SCHEMA = {
-  type: "object",
-  additionalProperties: false,
-  properties: {
-    summary: { type: "string" },
-    sources: {
-      type: "array",
-      items: {
-        type: "object",
-        additionalProperties: false,
-        properties: {
-          title: { type: "string" },
-          url: { type: "string" },
-          snippet: { type: "string" },
-        },
-        required: ["title", "url", "snippet"],
-      },
-    },
-  },
-  required: ["summary", "sources"],
-} as const;
+const SEARCH_OUTPUT_SCHEMA_PATH = fileURLToPath(
+  new URL("./search-output-schema.json", import.meta.url)
+);
 
 const LIVE_FRESHNESS_QUERY_PATTERN =
-  /\b(today|latest|current|now|score|result|results|weather|price|status|breaking|live|win|won|lose|lost|game|match|played|standing|schedule)\b/iu;
+  /\b(today|latest|current|now|weather|price|breaking|urgent)\b/iu;
 
 interface ResolvedWebSearchInput {
   query: string;
@@ -65,7 +49,10 @@ interface ResolvedWebSearchInput {
 }
 
 export function normalizeMaxSources(maxSources?: number): number {
-  if (maxSources === undefined) return DEFAULT_MAX_SOURCES;
+  if (maxSources === undefined || Number.isNaN(maxSources)) {
+    return DEFAULT_MAX_SOURCES;
+  }
+
   const rounded = Math.trunc(maxSources);
   return Math.min(Math.max(rounded, 1), MAX_ALLOWED_SOURCES);
 }
@@ -247,6 +234,8 @@ export async function executeCodexWebSearch(
       throw error;
     }
 
+    const retryError = error as Error;
+
     return runResolvedCodexWebSearch(
       {
         ...resolvedInput,
@@ -254,7 +243,13 @@ export async function executeCodexWebSearch(
         freshness: "live",
       },
       options,
-      runner
+      runner,
+      {
+        retriedFromFast: true,
+        originalMode: "fast",
+        originalFreshness: resolvedInput.freshness,
+        fallbackReason: retryError.message,
+      }
     );
   }
 }
@@ -262,7 +257,8 @@ export async function executeCodexWebSearch(
 async function runResolvedCodexWebSearch(
   input: ResolvedWebSearchInput,
   options: ExecuteCodexWebSearchOptions,
-  runner: RunCodexCommand
+  runner: RunCodexCommand,
+  retry: RetryProvenance | undefined = undefined
 ): Promise<{
   content: { type: "text"; text: string }[];
   details: CodexWebSearchDetails;
@@ -271,10 +267,15 @@ async function runResolvedCodexWebSearch(
   const policy = getSearchPolicy(mode);
   const progress = createSearchProgress(query, mode, freshness);
   const tempDir = await mkdtemp(join(tmpdir(), "pi-codex-web-search-"));
-  const schemaPath = join(tempDir, "schema.json");
   const outputPath = join(tempDir, "result.json");
 
-  await writeFile(schemaPath, `${JSON.stringify(SEARCH_OUTPUT_SCHEMA, null, 2)}\n`, "utf-8");
+  if (retry) {
+    emitProgressUpdate(
+      options,
+      progress,
+      `Retrying as ${mode}/${freshness} after fast/${retry.originalFreshness} failed: ${retry.fallbackReason}`
+    );
+  }
 
   emitProgressUpdate(options, progress, `Running ${mode} Codex web search for: ${query}`);
 
@@ -283,7 +284,7 @@ async function runResolvedCodexWebSearch(
 
   try {
     const runnerOptions: RunCodexCommandOptions = {
-      args: buildCodexExecArgs({ schemaPath, outputPath }, freshness),
+      args: buildCodexExecArgs({ schemaPath: SEARCH_OUTPUT_SCHEMA_PATH, outputPath }, freshness),
       cwd: options.cwd,
       stdin: buildCodexPrompt({ query, maxSources, mode }),
       timeoutMs: policy.timeoutMs,
@@ -345,6 +346,10 @@ async function runResolvedCodexWebSearch(
       sources: parsed.sources,
       truncated: renderedResult.truncated,
     };
+
+    if (retry) {
+      details.retry = retry;
+    }
 
     if (progress.latestQuery) {
       details.latestQuery = progress.latestQuery;
@@ -483,7 +488,7 @@ export async function runCodexCommand(
     child.on("error", (error) => {
       const message =
         (error as NodeJS.ErrnoException).code === "ENOENT"
-          ? "Could not find `codex` in PATH. Install Codex CLI and run `codex login` first."
+          ? "Could not find `codex` in PATH. Install Codex CLI, then run `codex login status` or `codex login`."
           : `Failed to start Codex CLI: ${error.message}`;
       finish(() => reject(new Error(message)));
     });
@@ -527,7 +532,10 @@ function buildCodexFailureMessage(result: RunCodexCommandResult): string {
   const stdoutTail = tailLines(result.stdout, 12);
   const details = [stderr, stdoutTail].filter(Boolean).join("\n\n");
   const suffix = details ? `\n\n${details}` : "";
-  return `codex exec failed with exit code ${result.code}.${suffix}`;
+  const authHelp = needsCodexAuthHelp(details)
+    ? "\n\nCodex authentication appears to be missing or expired. Run `codex login status` and `codex login` if needed."
+    : "";
+  return `codex exec failed with exit code ${result.code}.${suffix}${authHelp}`;
 }
 
 function tailLines(text: string, count: number): string {
@@ -538,6 +546,12 @@ function tailLines(text: string, count: number): string {
     .filter(Boolean);
 
   return lines.slice(-count).join("\n");
+}
+
+function needsCodexAuthHelp(text: string): boolean {
+  return /\bauth(?:entication)?\b|login|unauthorized|forbidden|expired session|api key|access token/i.test(
+    text
+  );
 }
 
 function markFastModeExhausted(turnState: WebSearchTurnState | undefined): void {
@@ -628,7 +642,7 @@ function collectSearchQueries(progress: WebSearchProgressDetails, line: string):
   const event = parseJsonObject(line);
   if (!event) return [];
 
-  const queries = extractCompletedSearchQueries(event);
+  const queries = extractSearchQueries(event);
   if (queries.length === 0) return [];
 
   const addedQueries: string[] = [];
@@ -686,34 +700,59 @@ function parseJsonObject(line: string): Record<string, unknown> | undefined {
   }
 }
 
-function extractCompletedSearchQueries(event: Record<string, unknown>): string[] {
-  if (event.type !== "item.completed") return [];
+function extractSearchQueries(event: Record<string, unknown>): string[] {
+  if (typeof event.type !== "string" || !event.type.startsWith("item.")) {
+    return [];
+  }
 
   const item = event.item;
   if (!item || typeof item !== "object") return [];
 
-  const typedItem = item as { type?: unknown; action?: unknown; query?: unknown };
-  if (typedItem.type !== "web_search") return [];
+  const typedItem = item as {
+    type?: unknown;
+    action?: unknown;
+    output?: unknown;
+    query?: unknown;
+    queries?: unknown;
+  };
 
-  const action = typedItem.action;
-  if (!action || typeof action !== "object") return [];
-
-  const typedAction = action as { type?: unknown; query?: unknown; queries?: unknown };
-  if (typedAction.type !== "search") return [];
-
-  if (Array.isArray(typedAction.queries)) {
-    return typedAction.queries.filter((query): query is string => typeof query === "string");
+  if (typedItem.type !== "web_search" && typedItem.type !== "web_search_call") {
+    return [];
   }
 
-  if (typeof typedAction.query === "string") {
-    return [typedAction.query];
+  const queries = [
+    ...extractQueryValues(typedItem.queries),
+    ...extractQueryValues(typedItem.query),
+    ...extractSearchActionQueries(typedItem.action),
+    ...extractSearchActionQueries(typedItem.output),
+  ];
+
+  return queries;
+}
+
+function extractSearchActionQueries(value: unknown): string[] {
+  if (!value || typeof value !== "object") {
+    return [];
   }
 
-  if (typeof typedItem.query === "string") {
-    return [typedItem.query];
+  const typedValue = value as { type?: unknown; query?: unknown; queries?: unknown };
+  if (typedValue.type !== undefined && typedValue.type !== "search") {
+    return [];
   }
 
-  return [];
+  return [...extractQueryValues(typedValue.queries), ...extractQueryValues(typedValue.query)];
+}
+
+function extractQueryValues(value: unknown): string[] {
+  if (typeof value === "string") {
+    return [value];
+  }
+
+  if (!Array.isArray(value)) {
+    return [];
+  }
+
+  return value.filter((query): query is string => typeof query === "string");
 }
 
 function isCodexWebSearchOutput(value: unknown): value is CodexWebSearchOutput {

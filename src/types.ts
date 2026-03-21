@@ -30,12 +30,20 @@ export interface WebSearchProgressDetails {
   latestQuery?: string;
 }
 
+export interface RetryProvenance {
+  retriedFromFast: true;
+  originalMode: "fast";
+  originalFreshness: SearchFreshness;
+  fallbackReason: string;
+}
+
 export interface CodexWebSearchDetails extends WebSearchProgressDetails {
   sourceCount: number;
   summary: string;
   sources: WebSearchSource[];
   truncated: boolean;
   fullOutputPath?: string;
+  retry?: RetryProvenance;
 }
 
 export interface WebSearchSettings {

@@ -13,17 +13,23 @@ It is designed for the case where:
 When Pi calls `web_search`, the extension runs Codex non-interactively:
 
 - `codex exec --json`
-- web-search freshness set explicitly to `cached` or `live`
+- `-c web_search="cached"` or `-c web_search="live"`
 - read-only sandbox
 - ephemeral session
 - structured JSON output enforced with `--output-schema`
+- final assistant message captured with `--output-last-message`
+
+Codex's official web-search modes are `disabled | cached | live`.
+This extension uses `cached` and `live` explicitly per tool call. In Codex CLI terms,
+`--search` is equivalent to live web search.
 
 The extension then:
 
-- parses Codex's live JSONL events to show search progress in Pi
-- tracks the actual search queries Codex issued
+- parses Codex JSONL events to show search progress in Pi
+- tracks the actual search queries Codex issued across multiple item event shapes
 - keeps a running search counter in the tool UI
-- uses persisted defaults for mode and freshness unless the tool call overrides mode
+- uses persisted defaults for mode and freshness unless the tool call overrides them
+- records when a default fast search had to be retried as deep/live
 - returns a concise summary plus numbered sources with URLs and snippets
 
 ## Requirements
@@ -87,8 +93,9 @@ Behavior:
   - deep freshness = `live`
 - supports explicit `deep` mode for broader research
 - supports explicit `cached`/`live` freshness overrides
-- automatically upgrades fast searches to `live` for freshness-sensitive questions like today, current, latest, sports results, scores, and weather unless you override freshness explicitly
+- keeps `cached` as the default for normal fast lookups and only auto-promotes to `live` for strong recency cues like `today`, `latest`, `current`, `now`, `weather`, `price`, `breaking`, and `urgent`
 - automatically retries one retryable default fast search as `deep` + `live` when Codex times out or fails to emit a usable final response
+- records that retry in the tool details so Pi can show that the result was recovered after fallback
 - falls back to Codex's final JSONL agent message if `--output-last-message` comes back empty
 - enforces smaller time/query budgets in fast mode so lightweight lookups do not run indefinitely
 - blocks repeated fast-mode retries within the same turn after fast mode has already been exhausted
@@ -96,6 +103,7 @@ Behavior:
 - supports expanded tool details with `Ctrl+O`
 - returns a compact answer with sources
 - truncates oversized output and saves the full result to a temp file when needed
+- surfaces clearer Codex auth guidance, including `codex login status` and `codex login`, when authentication appears to be missing or expired
 - fails clearly if `codex` is missing or `codex exec` fails
 
 ## Settings
@@ -117,6 +125,8 @@ You can also use direct subcommands:
 ```
 
 The settings file is stored under your Pi agent directory and is reused by future sessions.
+
+Note: current Codex docs describe the top-level `web_search` setting as the supported configuration surface. Older legacy settings such as `features.web_search_request` are deprecated.
 
 ## Example
 

@@ -20,8 +20,20 @@ import type {
   SearchFreshness,
   SearchMode,
   WebSearchProgressDetails,
+  WebSearchSettings,
   WebSearchTurnState,
 } from "./types.js";
+
+const SETTINGS_ARGUMENT_OPTIONS = [
+  "status",
+  "reset",
+  "default-mode fast",
+  "default-mode deep",
+  "fast-freshness cached",
+  "fast-freshness live",
+  "deep-freshness cached",
+  "deep-freshness live",
+] as const;
 
 export default function codexWebSearchExtension(pi: ExtensionAPI) {
   const turnState: WebSearchTurnState = { fastModeExhausted: false };
@@ -37,7 +49,7 @@ export default function codexWebSearchExtension(pi: ExtensionAPI) {
     name: TOOL_NAME,
     label: "Web Search",
     description:
-      "Search the public web through the locally installed Codex CLI and return a concise summary with sources. Use fast mode for quick factual lookups and deep mode only when the user explicitly wants broader research. Freshness can be cached or live, with live preferred for time-sensitive questions. The tool can automatically recover one retryable default fast search by rerunning it as deep/live. Defaults are configurable via /web-search-settings. Output is truncated to Pi's standard limits when needed. Requires `codex` to be installed and authenticated on this machine.",
+      "Search the public web through the locally installed Codex CLI and return a concise summary with sources. Use fast mode for quick factual lookups and deep mode only when the user explicitly wants broader research. Freshness can be cached or live, with live preferred for clearly time-sensitive requests. The tool can automatically recover one retryable default fast search by rerunning it as deep/live and records that retry in the tool details. Defaults are configurable via /web-search-settings. Output is truncated to Pi's standard limits when needed. Requires `codex` to be installed and authenticated on this machine.",
     parameters: Type.Object({
       query: Type.String({ description: "What to search for on the web" }),
       maxSources: Type.Optional(
@@ -92,10 +104,7 @@ export default function codexWebSearchExtension(pi: ExtensionAPI) {
         const content = result.content.find((part) => part.type === "text");
         if (content?.type === "text" && expanded) {
           return new Text(
-            `${theme.fg("success", "✓ Web search finished")}\n\n${content.text
-              .split("\n")
-              .map((line) => theme.fg("toolOutput", line))
-              .join("\n")}`,
+            `${theme.fg("success", "✓ Web search finished")}\n\n${formatToolOutput(content.text, theme)}`,
             0,
             0
           );
@@ -116,6 +125,10 @@ export default function codexWebSearchExtension(pi: ExtensionAPI) {
         text += theme.fg("warning", " (truncated)");
       }
 
+      if (details.retry) {
+        text += theme.fg("warning", " (retried)");
+      }
+
       if (!expanded) {
         text += theme.fg("dim", ` (${keyHint("expandTools", "to expand")})`);
         if (details.latestQuery) {
@@ -125,6 +138,10 @@ export default function codexWebSearchExtension(pi: ExtensionAPI) {
       }
 
       text += `\n${theme.fg("muted", `Original request: ${details.query}`)}`;
+      if (details.retry) {
+        text += `\n${theme.fg("warning", `Retried after ${details.retry.originalMode}/${details.retry.originalFreshness} failed`)}`;
+        text += `\n${theme.fg("dim", details.retry.fallbackReason)}`;
+      }
       if (details.searchQueries.length > 0) {
         text += `\n${theme.fg("muted", `Queries (${details.searchQueries.length}):`)}`;
         for (const [index, query] of details.searchQueries.entries()) {
@@ -134,10 +151,7 @@ export default function codexWebSearchExtension(pi: ExtensionAPI) {
 
       const content = result.content.find((part) => part.type === "text");
       if (content?.type === "text") {
-        text += `\n\n${content.text
-          .split("\n")
-          .map((line) => theme.fg("toolOutput", line))
-          .join("\n")}`;
+        text += `\n\n${formatToolOutput(content.text, theme)}`;
       }
 
       return new Text(text, 0, 0);
@@ -147,18 +161,8 @@ export default function codexWebSearchExtension(pi: ExtensionAPI) {
   pi.registerCommand(SETTINGS_COMMAND, {
     description: "Configure default mode and freshness for the web_search tool",
     getArgumentCompletions: (prefix) => {
-      const options = [
-        "status",
-        "reset",
-        "default-mode fast",
-        "default-mode deep",
-        "fast-freshness cached",
-        "fast-freshness live",
-        "deep-freshness cached",
-        "deep-freshness live",
-      ];
       const lowerPrefix = prefix.toLowerCase();
-      const matches = options.filter((option) => option.startsWith(lowerPrefix));
+      const matches = SETTINGS_ARGUMENT_OPTIONS.filter((option) => option.startsWith(lowerPrefix));
       return matches.length > 0 ? matches.map((value) => ({ value, label: value })) : null;
     },
     handler: async (args, ctx) => {
@@ -226,7 +230,7 @@ async function handleSettingsCommand(args: string, ctx: ExtensionCommandContext)
 async function openSettingsDialog(ctx: ExtensionCommandContext): Promise<void> {
   const settings = await loadSettings();
   const choice = await ctx.ui.select("Web search settings", [
-    `Show current settings`,
+    "Show current settings",
     `Default mode: ${settings.defaultMode}`,
     `Fast freshness: ${settings.fastFreshness}`,
     `Deep freshness: ${settings.deepFreshness}`,
@@ -237,52 +241,37 @@ async function openSettingsDialog(ctx: ExtensionCommandContext): Promise<void> {
 
   switch (choice) {
     case "Show current settings":
-      notify(ctx, buildSettingsHelp(settings));
+      await handleSettingsCommand("status", ctx);
       return;
 
     case `Default mode: ${settings.defaultMode}`: {
       const mode = await ctx.ui.select("Choose the default mode", ["fast", "deep"]);
       if (!mode) return;
-      const saved = await saveSettings({ ...settings, defaultMode: parseMode(mode) });
-      notify(ctx, `Default mode updated to ${saved.defaultMode}.`);
+      await handleSettingsCommand(`default-mode ${mode}`, ctx);
       return;
     }
 
     case `Fast freshness: ${settings.fastFreshness}`: {
       const freshness = await ctx.ui.select("Choose fast-mode freshness", ["cached", "live"]);
       if (!freshness) return;
-      const saved = await saveSettings({
-        ...settings,
-        fastFreshness: parseFreshness(freshness),
-      });
-      notify(ctx, `Fast freshness updated to ${saved.fastFreshness}.`);
+      await handleSettingsCommand(`fast-freshness ${freshness}`, ctx);
       return;
     }
 
     case `Deep freshness: ${settings.deepFreshness}`: {
       const freshness = await ctx.ui.select("Choose deep-mode freshness", ["cached", "live"]);
       if (!freshness) return;
-      const saved = await saveSettings({
-        ...settings,
-        deepFreshness: parseFreshness(freshness),
-      });
-      notify(ctx, `Deep freshness updated to ${saved.deepFreshness}.`);
+      await handleSettingsCommand(`deep-freshness ${freshness}`, ctx);
       return;
     }
 
-    case "Reset to defaults": {
-      const saved = await saveSettings(DEFAULT_WEB_SEARCH_SETTINGS);
-      notify(ctx, `Web search settings reset.\n\n${formatSettings(saved)}`);
+    case "Reset to defaults":
+      await handleSettingsCommand("reset", ctx);
       return;
-    }
   }
 }
 
-function buildSettingsHelp(settings: {
-  defaultMode: SearchMode;
-  fastFreshness: SearchFreshness;
-  deepFreshness: SearchFreshness;
-}): string {
+function buildSettingsHelp(settings: WebSearchSettings): string {
   return [
     "Current web search settings:",
     formatSettings(settings),
@@ -381,6 +370,18 @@ function renderProgress(
     text += `\n${theme.fg("dim", `  ${index + 1}. ${query}`)}`;
   }
   return text;
+}
+
+function formatToolOutput(
+  text: string,
+  theme: {
+    fg: (color: "toolOutput", text: string) => string;
+  }
+): string {
+  return text
+    .split("\n")
+    .map((line) => theme.fg("toolOutput", line))
+    .join("\n");
 }
 
 function formatInlineQuery(query: unknown, maxLength = 90): string {
