@@ -55,11 +55,10 @@ export function normalizeMaxSources(
   fallback = DEFAULT_WEB_SEARCH_SETTINGS.fastMaxSources
 ): number {
   if (maxSources === undefined || Number.isNaN(maxSources)) {
-    return fallback;
+    return clampMaxSources(fallback);
   }
 
-  const rounded = Math.trunc(maxSources);
-  return Math.min(Math.max(rounded, 1), MAX_ALLOWED_SOURCES);
+  return clampMaxSources(maxSources);
 }
 
 export function normalizeQuery(query: string): string {
@@ -404,17 +403,27 @@ async function runResolvedCodexWebSearch(
       timeoutMs: policy.timeoutMs,
       signal,
       onStdoutLine: (line) => {
+        const previousSearchCount = progress.searchCount;
         const updates = collectSearchQueries(progress, line);
         for (const addedQuery of updates) {
           emitProgressUpdate(options, progress, `Search #${progress.searchCount}: ${addedQuery}`);
         }
 
-        if (mode === "fast" && progress.searchCount === policy.queryBudget && !warnedAtFastBudget) {
+        if (
+          mode === "fast" &&
+          previousSearchCount < policy.queryBudget &&
+          progress.searchCount >= policy.queryBudget &&
+          !warnedAtFastBudget
+        ) {
           warnedAtFastBudget = true;
           emitProgressUpdate(
             options,
             progress,
-            buildFastBudgetWarning(policy.queryBudget, allowFastAutoEscalation)
+            buildFastBudgetWarning(
+              progress.searchCount,
+              policy.queryBudget,
+              allowFastAutoEscalation
+            )
           );
         }
 
@@ -422,14 +431,20 @@ async function runResolvedCodexWebSearch(
           if (mode === "fast") {
             markFastModeExhausted(options.turnState);
             abortController.abort(
-              new Error(buildFastBudgetFailure(policy.queryBudget, allowFastAutoEscalation))
+              new Error(
+                buildFastBudgetFailure(
+                  progress.searchCount,
+                  policy.queryBudget,
+                  allowFastAutoEscalation
+                )
+              )
             );
             return;
           }
 
           abortController.abort(
             new Error(
-              `Codex exceeded the deep search budget (${policy.queryBudget} queries). Narrow the request or make the query more specific.`
+              `Codex exceeded the deep search budget (${progress.searchCount}/${policy.queryBudget} queries). Narrow the request or make the query more specific.`
             )
           );
         }
@@ -500,20 +515,28 @@ function buildFastRetryStatus(
   return `${action} ${reason}`;
 }
 
-function buildFastBudgetWarning(queryBudget: number, allowFastAutoEscalation: boolean): string {
+function buildFastBudgetWarning(
+  searchCount: number,
+  queryBudget: number,
+  allowFastAutoEscalation: boolean
+): string {
   if (allowFastAutoEscalation) {
-    return `Fast mode has used its full query budget (${queryBudget}/${queryBudget}). If Codex needs another search, it will auto-escalate once to deep/live.`;
+    return `Fast mode has used its full query budget (${searchCount}/${queryBudget}). If Codex needs another search, it will auto-escalate once to deep/live.`;
   }
 
-  return `Fast mode has used its full query budget (${queryBudget}/${queryBudget}). If Codex needs another search, this run will fail. Rerun with mode=deep or freshness=live for a broader search.`;
+  return `Fast mode has used its full query budget (${searchCount}/${queryBudget}). If Codex needs another search, this run will fail. Rerun with mode=deep or freshness=live for a broader search.`;
 }
 
-function buildFastBudgetFailure(queryBudget: number, allowFastAutoEscalation: boolean): string {
+function buildFastBudgetFailure(
+  searchCount: number,
+  queryBudget: number,
+  allowFastAutoEscalation: boolean
+): string {
   if (allowFastAutoEscalation) {
-    return `Fast mode exhausted its query budget (${queryBudget} queries). Auto-escalating once to deep/live.`;
+    return `Fast mode exhausted its query budget (${searchCount}/${queryBudget} queries). Auto-escalating once to deep/live.`;
   }
 
-  return `Codex exceeded the fast search budget (${queryBudget} queries). Do not retry fast mode again in this turn; rerun with mode=deep or freshness=live if you need broader or fresher results.`;
+  return `Codex exceeded the fast search budget (${searchCount}/${queryBudget} queries). Do not retry fast mode again in this turn; rerun with mode=deep or freshness=live if you need broader or fresher results.`;
 }
 
 async function maybeRunDefuddleSearch(
@@ -563,7 +586,10 @@ async function maybeRunDefuddleSearch(
           })
         : await defuddleRunner({ ...runnerOptions, timeoutMs: settings.defuddleTimeoutMs });
       results.push(parsed);
-    } catch {
+    } catch (error) {
+      if (options.signal?.aborted || isAbortLikeError(error)) {
+        throw error;
+      }
       continue;
     }
   }
@@ -900,14 +926,37 @@ function collectSearchQueries(progress: WebSearchProgressDetails, line: string):
   const addedQueries: string[] = [];
   for (const query of queries) {
     const normalized = query.trim();
-    if (!normalized || progress.searchQueries.includes(normalized)) continue;
-    progress.searchQueries.push(normalized);
-    progress.searchCount = progress.searchQueries.length;
+    if (!normalized) continue;
+
+    progress.searchCount += 1;
     progress.latestQuery = normalized;
+
+    if (progress.searchQueries.includes(normalized)) {
+      continue;
+    }
+
+    progress.searchQueries.push(normalized);
     addedQueries.push(normalized);
   }
 
   return addedQueries;
+}
+
+function clampMaxSources(value: number): number {
+  if (!Number.isFinite(value)) {
+    return 1;
+  }
+
+  const rounded = Math.trunc(value);
+  return Math.min(Math.max(rounded, 1), MAX_ALLOWED_SOURCES);
+}
+
+function isAbortLikeError(error: unknown): boolean {
+  if (typeof DOMException !== "undefined" && error instanceof DOMException) {
+    return error.name === "AbortError";
+  }
+
+  return error instanceof Error && error.name === "AbortError";
 }
 
 async function renderToolResult(text: string): Promise<{
@@ -979,7 +1028,7 @@ function extractSearchQueries(event: Record<string, unknown>): string[] {
     ...extractSearchActionQueries(typedItem.output),
   ];
 
-  return queries;
+  return dedupeQueries(queries);
 }
 
 function extractSearchActionQueries(value: unknown): string[] {
@@ -1005,6 +1054,20 @@ function extractQueryValues(value: unknown): string[] {
   }
 
   return value.filter((query): query is string => typeof query === "string");
+}
+
+function dedupeQueries(queries: string[]): string[] {
+  const uniqueQueries: string[] = [];
+
+  for (const query of queries) {
+    const normalized = query.trim();
+    if (!normalized || uniqueQueries.includes(normalized)) {
+      continue;
+    }
+    uniqueQueries.push(normalized);
+  }
+
+  return uniqueQueries;
 }
 
 function isCodexWebSearchOutput(value: unknown): value is CodexWebSearchOutput {

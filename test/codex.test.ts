@@ -22,6 +22,8 @@ import type { RunCodexCommand, RunDefuddleCommand } from "../src/types.js";
 void test("normalizeMaxSources clamps values into the supported range", () => {
   assert.equal(normalizeMaxSources(undefined), DEFAULT_FAST_MAX_SOURCES);
   assert.equal(normalizeMaxSources(Number.NaN), DEFAULT_FAST_MAX_SOURCES);
+  assert.equal(normalizeMaxSources(undefined, 999), MAX_ALLOWED_SOURCES);
+  assert.equal(normalizeMaxSources(undefined, 0), 1);
   assert.equal(normalizeMaxSources(0), 1);
   assert.equal(normalizeMaxSources(3.9), 3);
   assert.equal(normalizeMaxSources(999), MAX_ALLOWED_SOURCES);
@@ -399,6 +401,26 @@ void test("executeCodexWebSearch uses Defuddle directly for URL-only queries", a
   ]);
   assert.match(result.details.summary, /Defuddle extracted clean content directly/);
   assert.equal(result.details.sources[0]?.title, "Features – Codex CLI | OpenAI Developers");
+});
+
+void test("executeCodexWebSearch rethrows Defuddle cancellations", async () => {
+  const abortController = new AbortController();
+  const abortError = new DOMException("Aborted", "AbortError");
+  abortController.abort(abortError);
+
+  const defuddleRunner: RunDefuddleCommand = () => Promise.reject(abortError);
+
+  await assert.rejects(
+    executeCodexWebSearch(
+      { query: "https://developers.openai.com/codex/cli/features" },
+      {
+        cwd: process.cwd(),
+        signal: abortController.signal,
+        defuddleRunner,
+      }
+    ),
+    /Aborted/
+  );
 });
 
 void test("executeCodexWebSearch falls back to Defuddle for URL-based requests when Codex fails", async () => {
@@ -864,6 +886,45 @@ void test("executeCodexWebSearch allows runs that use the full fast search budge
 
   assert.equal(result.details.searchCount, 10);
   assert.match(result.content[0]?.text ?? "", /Completed at the fast search budget\./);
+});
+
+void test("executeCodexWebSearch counts repeated identical searches against the fast budget", async () => {
+  const runner: RunCodexCommand = ({ onStdoutLine, signal }) => {
+    for (let i = 1; i <= 11; i += 1) {
+      onStdoutLine?.(
+        JSON.stringify({
+          type: "item.completed",
+          item: {
+            type: "web_search",
+            action: {
+              type: "search",
+              query: "same query",
+              queries: ["same query"],
+            },
+          },
+        })
+      );
+      if (signal?.aborted) break;
+    }
+
+    const reason: unknown = signal?.reason;
+    return Promise.reject(
+      reason instanceof Error
+        ? reason
+        : new Error(typeof reason === "string" ? reason : "expected abort")
+    );
+  };
+
+  await assert.rejects(
+    executeCodexWebSearch(
+      { query: "weather in Tokyo", mode: "fast" },
+      {
+        cwd: process.cwd(),
+        runner,
+      }
+    ),
+    /11\/10 queries/
+  );
 });
 
 void test("executeCodexWebSearch aborts explicit fast mode when Codex exceeds the search budget", async () => {
