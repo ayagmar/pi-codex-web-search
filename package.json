@@ -48,9 +48,9 @@
     "@sinclair/typebox": "*"
   },
   "devDependencies": {
-    "@mariozechner/pi-ai": "^0.52.8",
-    "@mariozechner/pi-coding-agent": "^0.52.8",
-    "@mariozechner/pi-tui": "^0.52.8",
+    "@mariozechner/pi-ai": "^0.62.0",
+    "@mariozechner/pi-coding-agent": "^0.62.0",
+    "@mariozechner/pi-tui": "^0.62.0",
     "@release-it/conventional-changelog": "^10.0.5",
     "@sinclair/typebox": "^0.34.48",
     "@types/node": "^22.19.10",

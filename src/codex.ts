@@ -19,6 +19,8 @@ import {
 } from "./defuddle.js";
 import { DEFAULT_WEB_SEARCH_SETTINGS } from "./settings.js";
 import type {
+  CodexFailureDetails,
+  CodexFailureKind,
   CodexWebSearchDetails,
   CodexWebSearchOutput,
   DefuddleParseResult,
@@ -48,6 +50,24 @@ interface ResolvedWebSearchInput {
   maxSources: number;
   mode: SearchMode;
   freshness: SearchFreshness;
+}
+
+interface CodexJsonlSummary {
+  finalAgentMessage?: string;
+  turnFailedMessage?: string;
+  errorMessages: string[];
+}
+
+class CodexWebSearchFailure extends Error {
+  readonly failure: CodexFailureDetails;
+  readonly progress: WebSearchProgressDetails;
+
+  constructor(failure: CodexFailureDetails, progress: WebSearchProgressDetails) {
+    super(failure.message);
+    this.name = "CodexWebSearchFailure";
+    this.failure = failure;
+    this.progress = progress;
+  }
 }
 
 export function normalizeMaxSources(
@@ -280,9 +300,32 @@ export async function executeCodexWebSearch(
   }
 
   if (resolvedInput.mode === "fast" && options.turnState?.fastModeExhausted) {
-    throw new Error(
-      "Fast search already failed earlier in this turn. Do not retry fast mode in the same turn; rerun with mode=deep or freshness=live if you need broader or fresher results."
+    const exhaustedProgress = createSearchProgress(
+      resolvedInput.query,
+      resolvedInput.mode,
+      resolvedInput.freshness
     );
+    const exhaustedFailure = createCodexFailure(
+      "budget",
+      "Fast search already failed earlier in this turn. Use deep or live search if you still need broader or fresher results.",
+      true
+    );
+
+    const exhaustedDefuddleFallback = await maybeRunDefuddleSearch(
+      resolvedInput,
+      options,
+      settings,
+      {
+        directUrlQuery: false,
+        reason: exhaustedFailure.message,
+      }
+    );
+
+    if (exhaustedDefuddleFallback) {
+      return exhaustedDefuddleFallback;
+    }
+
+    return buildSoftFailureResult(resolvedInput, exhaustedProgress, exhaustedFailure);
   }
 
   try {
@@ -295,13 +338,15 @@ export async function executeCodexWebSearch(
       allowFastAutoEscalation
     );
   } catch (error) {
-    if (shouldRetryWithDeepLiveSearch(input, resolvedInput, error)) {
-      const retryReason = errorMessage(error);
+    const failure = getCodexFailure(error);
+    const progress = getFailureProgress(error, resolvedInput);
+
+    if (shouldRetryWithDeepLiveSearch(input, resolvedInput, failure)) {
       const retry: RetryProvenance = {
         retriedFromFast: true,
         originalMode: "fast",
         originalFreshness: resolvedInput.freshness,
-        fallbackReason: retryReason,
+        fallbackReason: failure.message,
       };
 
       try {
@@ -317,6 +362,21 @@ export async function executeCodexWebSearch(
           retry
         );
       } catch (retryFailure) {
+        const retryFailureDetails = getCodexFailure(retryFailure);
+        const retryProgress = getFailureProgress(retryFailure, {
+          ...resolvedInput,
+          mode: "deep",
+          freshness: "live",
+        });
+
+        if (shouldExhaustFastModeInTurn(failure)) {
+          markFastModeExhausted(options.turnState);
+        }
+
+        if (shouldThrowCodexFailure(retryFailureDetails)) {
+          throw asError(retryFailureDetails, retryProgress);
+        }
+
         const defuddleRetryFallback = await maybeRunDefuddleSearch(
           {
             ...resolvedInput,
@@ -327,7 +387,7 @@ export async function executeCodexWebSearch(
           settings,
           {
             directUrlQuery: false,
-            reason: errorMessage(retryFailure),
+            reason: retryFailureDetails.message,
             retry,
           }
         );
@@ -336,20 +396,33 @@ export async function executeCodexWebSearch(
           return defuddleRetryFallback;
         }
 
-        throw retryFailure;
+        return buildSoftFailureResult(
+          {
+            ...resolvedInput,
+            mode: "deep",
+            freshness: "live",
+          },
+          retryProgress,
+          retryFailureDetails,
+          retry
+        );
       }
+    }
+
+    if (shouldThrowCodexFailure(failure)) {
+      throw asError(failure, progress);
     }
 
     const defuddleFallback = await maybeRunDefuddleSearch(resolvedInput, options, settings, {
       directUrlQuery: false,
-      reason: errorMessage(error),
+      reason: failure.message,
     });
 
     if (defuddleFallback) {
       return defuddleFallback;
     }
 
-    throw error;
+    return buildSoftFailureResult(resolvedInput, progress, failure);
   }
 }
 
@@ -404,9 +477,12 @@ async function runResolvedCodexWebSearch(
       signal,
       onStdoutLine: (line) => {
         const previousSearchCount = progress.searchCount;
-        const updates = collectSearchQueries(progress, line);
-        for (const addedQuery of updates) {
+        const updates = collectProgressUpdates(progress, line);
+        for (const addedQuery of updates.queries) {
           emitProgressUpdate(options, progress, `Search #${progress.searchCount}: ${addedQuery}`);
+        }
+        for (const status of updates.statuses) {
+          emitProgressUpdate(options, progress, status);
         }
 
         if (
@@ -429,7 +505,9 @@ async function runResolvedCodexWebSearch(
 
         if (progress.searchCount > policy.queryBudget && !abortController.signal.aborted) {
           if (mode === "fast") {
-            markFastModeExhausted(options.turnState);
+            if (!allowFastAutoEscalation) {
+              markFastModeExhausted(options.turnState);
+            }
             abortController.abort(
               new Error(
                 buildFastBudgetFailure(
@@ -456,18 +534,43 @@ async function runResolvedCodexWebSearch(
     try {
       runResult = await runner(runnerOptions);
     } catch (error) {
-      if (mode === "fast" && shouldBlockFurtherFastRetries(error)) {
+      const failure = getCodexFailure(error);
+      if (mode === "fast" && !allowFastAutoEscalation && shouldExhaustFastModeInTurn(failure)) {
         markFastModeExhausted(options.turnState);
       }
-      throw error;
+      throw asError(failure, progress);
     }
 
     if (runResult.code !== 0) {
-      throw new Error(buildCodexFailureMessage(runResult));
+      const failure = buildCodexFailure(runResult);
+      if (mode === "fast" && !allowFastAutoEscalation && shouldExhaustFastModeInTurn(failure)) {
+        markFastModeExhausted(options.turnState);
+      }
+      throw asError(failure, progress);
     }
 
-    const rawOutput = await readFinalCodexOutput(outputPath, runResult.stdout);
-    const parsed = parseCodexWebSearchOutput(rawOutput, maxSources);
+    let rawOutput: string;
+    try {
+      rawOutput = await readFinalCodexOutput(outputPath, runResult.stdout);
+    } catch (error) {
+      const failure = getCodexFailure(error);
+      if (mode === "fast" && !allowFastAutoEscalation && shouldExhaustFastModeInTurn(failure)) {
+        markFastModeExhausted(options.turnState);
+      }
+      throw asError(failure, progress);
+    }
+
+    let parsed: CodexWebSearchOutput;
+    try {
+      parsed = parseCodexWebSearchOutput(rawOutput, maxSources);
+    } catch (error) {
+      const failure = getCodexFailure(error);
+      if (mode === "fast" && !allowFastAutoEscalation && shouldExhaustFastModeInTurn(failure)) {
+        markFastModeExhausted(options.turnState);
+      }
+      throw asError(failure, progress);
+    }
+
     const formattedResult = formatWebSearchResult(parsed);
     const renderedResult = await renderToolResult(formattedResult);
 
@@ -477,6 +580,7 @@ async function runResolvedCodexWebSearch(
       freshness,
       searchCount: progress.searchCount,
       searchQueries: [...progress.searchQueries],
+      statusEvents: [...progress.statusEvents],
       sourceCount: parsed.sources.length,
       summary: parsed.summary,
       sources: parsed.sources,
@@ -502,6 +606,67 @@ async function runResolvedCodexWebSearch(
   } finally {
     await rm(tempDir, { recursive: true, force: true });
   }
+}
+
+async function buildSoftFailureResult(
+  input: ResolvedWebSearchInput,
+  progress: WebSearchProgressDetails,
+  failure: CodexFailureDetails,
+  retry?: RetryProvenance
+): Promise<{
+  content: { type: "text"; text: string }[];
+  details: CodexWebSearchDetails;
+}> {
+  const summary = buildSoftFailureSummary(failure, retry);
+  const renderedResult = await renderToolResult(buildSoftFailureBody(summary, failure));
+
+  const details: CodexWebSearchDetails = {
+    query: input.query,
+    mode: input.mode,
+    freshness: input.freshness,
+    searchCount: progress.searchCount,
+    searchQueries: [...progress.searchQueries],
+    statusEvents: [...progress.statusEvents],
+    sourceCount: 0,
+    summary,
+    sources: [],
+    truncated: renderedResult.truncated,
+    failure,
+  };
+
+  if (retry) {
+    details.retry = retry;
+  }
+
+  if (progress.latestQuery) {
+    details.latestQuery = progress.latestQuery;
+  }
+
+  if (renderedResult.fullOutputPath) {
+    details.fullOutputPath = renderedResult.fullOutputPath;
+  }
+
+  return {
+    content: [{ type: "text", text: renderedResult.text }],
+    details,
+  };
+}
+
+function buildSoftFailureSummary(
+  failure: CodexFailureDetails,
+  retry: RetryProvenance | undefined
+): string {
+  const attempt = retry
+    ? `Codex web search could not produce a usable result after retrying as deep/live.`
+    : `Codex web search could not produce a usable result.`;
+  const guidance = failure.recoverable
+    ? "No verified web summary is available from this run."
+    : "This run needs manual intervention before web search can succeed.";
+  return `${attempt} ${guidance}`;
+}
+
+function buildSoftFailureBody(summary: string, failure: CodexFailureDetails): string {
+  return [summary, "", `Failure kind: ${failure.kind}`, `Reason: ${failure.message}`].join("\n");
 }
 
 function buildFastRetryStatus(
@@ -611,6 +776,7 @@ async function maybeRunDefuddleSearch(
     freshness: input.freshness,
     searchCount: 0,
     searchQueries: [],
+    statusEvents: [...progress.statusEvents],
     sourceCount: sources.length,
     summary,
     sources,
@@ -651,41 +817,107 @@ async function readFinalCodexOutput(outputPath: string, stdout: string): Promise
     return rawOutput;
   }
 
-  const fallbackOutput = extractFinalAgentMessage(stdout);
-  if (fallbackOutput) {
-    return fallbackOutput;
+  const summary = summarizeCodexStdout(stdout);
+  if (summary.finalAgentMessage) {
+    return summary.finalAgentMessage;
+  }
+
+  if (summary.turnFailedMessage || summary.errorMessages.length > 0) {
+    throw new Error(
+      summary.turnFailedMessage ??
+        summary.errorMessages.at(-1) ??
+        "Codex did not return a usable response."
+    );
   }
 
   throw new Error("Codex did not write a final response to the output file or stdout events.");
 }
 
-function extractFinalAgentMessage(stdout: string): string | undefined {
-  let latestAgentMessage: string | undefined;
+function summarizeCodexStdout(stdout: string): CodexJsonlSummary {
+  const errorMessages: string[] = [];
+  let finalAgentMessage: string | undefined;
+  let turnFailedMessage: string | undefined;
 
   for (const line of stdout.split(/\r?\n/u)) {
     const event = parseJsonObject(line);
-    if (!event || event.type !== "item.completed") continue;
+    if (!event) continue;
 
-    const item = event.item;
-    if (!item || typeof item !== "object") continue;
+    const agentMessage = extractFinalAgentMessageFromEvent(event);
+    if (agentMessage) {
+      finalAgentMessage = agentMessage;
+    }
 
-    const typedItem = item as { type?: unknown; text?: unknown };
-    if (typedItem.type === "agent_message" && typeof typedItem.text === "string") {
-      latestAgentMessage = typedItem.text;
+    const errorMessage = extractErrorMessageFromEvent(event);
+    if (errorMessage) {
+      errorMessages.push(errorMessage);
+      if (event.type === "turn.failed") {
+        turnFailedMessage = errorMessage;
+      }
     }
   }
 
-  return latestAgentMessage?.trim() || undefined;
+  return {
+    ...(finalAgentMessage ? { finalAgentMessage } : {}),
+    ...(turnFailedMessage ? { turnFailedMessage } : {}),
+    errorMessages,
+  };
 }
 
-function errorMessage(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
+function extractFinalAgentMessageFromEvent(event: Record<string, unknown>): string | undefined {
+  if (event.type !== "item.completed") {
+    return undefined;
+  }
+
+  const item = event.item;
+  if (!item || typeof item !== "object") {
+    return undefined;
+  }
+
+  const typedItem = item as { type?: unknown; text?: unknown };
+  if (typedItem.type !== "agent_message" || typeof typedItem.text !== "string") {
+    return undefined;
+  }
+
+  return typedItem.text.trim() || undefined;
+}
+
+function extractErrorMessageFromEvent(event: Record<string, unknown>): string | undefined {
+  if (event.type === "error" && typeof event.message === "string") {
+    return event.message.trim() || undefined;
+  }
+
+  if (event.type === "turn.failed") {
+    const error = event.error;
+    if (
+      error &&
+      typeof error === "object" &&
+      typeof (error as { message?: unknown }).message === "string"
+    ) {
+      return (error as { message: string }).message.trim() || undefined;
+    }
+    return undefined;
+  }
+
+  if (
+    (event.type === "item.started" ||
+      event.type === "item.updated" ||
+      event.type === "item.completed") &&
+    event.item &&
+    typeof event.item === "object"
+  ) {
+    const item = event.item as { type?: unknown; message?: unknown };
+    if (item.type === "error" && typeof item.message === "string") {
+      return item.message.trim() || undefined;
+    }
+  }
+
+  return undefined;
 }
 
 function shouldRetryWithDeepLiveSearch(
   originalInput: WebSearchInput,
   resolvedInput: ResolvedWebSearchInput,
-  error: unknown
+  failure: CodexFailureDetails
 ): boolean {
   if (resolvedInput.mode !== "fast") {
     return false;
@@ -695,13 +927,133 @@ function shouldRetryWithDeepLiveSearch(
     return false;
   }
 
-  if (!(error instanceof Error)) {
-    return false;
+  return failure.recoverable;
+}
+
+function createCodexFailure(
+  kind: CodexFailureKind,
+  message: string,
+  recoverable: boolean
+): CodexFailureDetails {
+  return {
+    kind,
+    message,
+    recoverable,
+  };
+}
+
+function getCodexFailure(error: unknown): CodexFailureDetails {
+  if (error instanceof CodexWebSearchFailure) {
+    return error.failure;
   }
 
-  return /timed out|query budget|search budget|did not write a final response|invalid JSON|empty summary|does not match the expected web search schema|no result provided/i.test(
-    error.message
+  const message = error instanceof Error ? error.message : String(error);
+  return classifyFailureText(message);
+}
+
+function getFailureProgress(
+  error: unknown,
+  input: ResolvedWebSearchInput
+): WebSearchProgressDetails {
+  if (error instanceof CodexWebSearchFailure) {
+    return error.progress;
+  }
+
+  return createSearchProgress(input.query, input.mode, input.freshness);
+}
+
+function asError(
+  failure: CodexFailureDetails,
+  progress: WebSearchProgressDetails
+): CodexWebSearchFailure {
+  return new CodexWebSearchFailure(failure, cloneProgress(progress));
+}
+
+function shouldThrowCodexFailure(failure: CodexFailureDetails): boolean {
+  return (
+    failure.kind === "auth" ||
+    failure.kind === "missing_cli" ||
+    failure.kind === "local_config" ||
+    failure.kind === "cancelled"
   );
+}
+
+function buildCodexFailure(result: RunCodexCommandResult): CodexFailureDetails {
+  const stdoutSummary = summarizeCodexStdout(result.stdout);
+  const details = [
+    stdoutSummary.turnFailedMessage,
+    stdoutSummary.errorMessages.at(-1),
+    result.stderr.trim(),
+    tailLines(result.stdout, 12),
+  ]
+    .filter(Boolean)
+    .join("\n\n");
+  const message = details
+    ? `codex exec failed with exit code ${result.code}.\n\n${details}`
+    : `codex exec failed with exit code ${result.code}.`;
+  const classified = classifyFailureText(message);
+
+  if (classified.kind === "auth") {
+    return createCodexFailure(
+      classified.kind,
+      `${message}\n\nCodex authentication appears to be missing or expired. Run \`codex login status\` and \`codex login\` if needed.`,
+      false
+    );
+  }
+
+  return createCodexFailure(classified.kind, message, classified.recoverable);
+}
+
+function classifyFailureText(message: string): CodexFailureDetails {
+  if (needsCodexAuthHelp(message)) {
+    return createCodexFailure("auth", message, false);
+  }
+
+  if (/could not find `codex` in path/i.test(message)) {
+    return createCodexFailure("missing_cli", message, false);
+  }
+
+  if (/failed to start codex cli|invalid .*config|config error/i.test(message)) {
+    return createCodexFailure("local_config", message, false);
+  }
+
+  if (/\bcancel(?:led|ed)?\b|abort(?:ed)?/i.test(message)) {
+    return createCodexFailure("cancelled", message, false);
+  }
+
+  if (/rate limit|too many requests|\b429\b|quota|capacity/i.test(message)) {
+    return createCodexFailure("rate_limit", message, true);
+  }
+
+  if (/timed out|timeout waiting/i.test(message)) {
+    return createCodexFailure("timeout", message, true);
+  }
+
+  if (/query budget|search budget|failed earlier in this turn/i.test(message)) {
+    return createCodexFailure("budget", message, true);
+  }
+
+  if (/invalid JSON|does not match the expected web search schema/i.test(message)) {
+    return createCodexFailure("schema", message, true);
+  }
+
+  if (
+    /empty summary|did not write a final response|no result provided|no usable response/i.test(
+      message
+    )
+  ) {
+    return createCodexFailure("empty_result", message, true);
+  }
+
+  if (
+    /stream disconnected before completion|error sending request|transport failed|disconnected|reconnect|reconnecting|websocket|https transport|internal server error|bad gateway|service unavailable|gateway timeout|temporarily unavailable|\b5\d\d\b|tls|ssl|certificate|dns|eai_again|enotfound|econnreset|econnrefused|connection reset|connection refused|connection aborted|socket hang up|network error|failed to connect|connect error|connection closed/i.test(
+      message
+    )
+  ) {
+    return createCodexFailure("transport", message, true);
+  }
+
+  return createCodexFailure("unknown", message, false);
 }
 
 export async function runCodexCommand(
@@ -799,17 +1151,6 @@ export async function runCodexCommand(
   });
 }
 
-function buildCodexFailureMessage(result: RunCodexCommandResult): string {
-  const stderr = result.stderr.trim();
-  const stdoutTail = tailLines(result.stdout, 12);
-  const details = [stderr, stdoutTail].filter(Boolean).join("\n\n");
-  const suffix = details ? `\n\n${details}` : "";
-  const authHelp = needsCodexAuthHelp(details)
-    ? "\n\nCodex authentication appears to be missing or expired. Run `codex login status` and `codex login` if needed."
-    : "";
-  return `codex exec failed with exit code ${result.code}.${suffix}${authHelp}`;
-}
-
 function tailLines(text: string, count: number): string {
   const lines = text
     .trim()
@@ -832,12 +1173,8 @@ function markFastModeExhausted(turnState: WebSearchTurnState | undefined): void 
   }
 }
 
-function shouldBlockFurtherFastRetries(error: unknown): boolean {
-  if (!(error instanceof Error)) {
-    return false;
-  }
-
-  return /query budget|search budget|timed out/i.test(error.message);
+function shouldExhaustFastModeInTurn(failure: CodexFailureDetails): boolean {
+  return failure.kind === "budget" || failure.kind === "timeout";
 }
 
 function getSearchPolicy(
@@ -868,6 +1205,20 @@ function createSearchProgress(
     freshness,
     searchCount: 0,
     searchQueries: [],
+    statusEvents: [],
+  };
+}
+
+function cloneProgress(progress: WebSearchProgressDetails): WebSearchProgressDetails {
+  return {
+    query: progress.query,
+    mode: progress.mode,
+    freshness: progress.freshness,
+    searchCount: progress.searchCount,
+    searchQueries: [...progress.searchQueries],
+    statusEvents: [...progress.statusEvents],
+    ...(progress.latestQuery ? { latestQuery: progress.latestQuery } : {}),
+    ...(progress.statusText ? { statusText: progress.statusText } : {}),
   };
 }
 
@@ -878,18 +1229,7 @@ function emitProgressUpdate(
 ): void {
   progress.statusText = text;
 
-  const details: WebSearchProgressDetails = {
-    query: progress.query,
-    mode: progress.mode,
-    freshness: progress.freshness,
-    searchCount: progress.searchCount,
-    searchQueries: [...progress.searchQueries],
-    statusText: progress.statusText,
-  };
-
-  if (progress.latestQuery) {
-    details.latestQuery = progress.latestQuery;
-  }
+  const details = cloneProgress(progress);
 
   options.onUpdate?.({
     content: [{ type: "text", text }],
@@ -916,10 +1256,24 @@ function mergeAbortSignals(
   return localController.signal;
 }
 
-function collectSearchQueries(progress: WebSearchProgressDetails, line: string): string[] {
+function collectProgressUpdates(
+  progress: WebSearchProgressDetails,
+  line: string
+): { queries: string[]; statuses: string[] } {
   const event = parseJsonObject(line);
-  if (!event) return [];
+  if (!event) {
+    return { queries: [], statuses: [] };
+  }
 
+  const queries = collectSearchQueries(progress, event);
+  const statuses = collectStatusEvents(progress, event);
+  return { queries, statuses };
+}
+
+function collectSearchQueries(
+  progress: WebSearchProgressDetails,
+  event: Record<string, unknown>
+): string[] {
   const queries = extractSearchQueries(event);
   if (queries.length === 0) return [];
 
@@ -940,6 +1294,27 @@ function collectSearchQueries(progress: WebSearchProgressDetails, line: string):
   }
 
   return addedQueries;
+}
+
+function collectStatusEvents(
+  progress: WebSearchProgressDetails,
+  event: Record<string, unknown>
+): string[] {
+  const message = extractErrorMessageFromEvent(event);
+  if (!message) {
+    return [];
+  }
+
+  if (progress.statusEvents.at(-1) === message) {
+    return [];
+  }
+
+  progress.statusEvents.push(message);
+  if (progress.statusEvents.length > 8) {
+    progress.statusEvents.splice(0, progress.statusEvents.length - 8);
+  }
+
+  return [message];
 }
 
 function clampMaxSources(value: number): number {
