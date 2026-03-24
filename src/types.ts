@@ -3,6 +3,18 @@ import type { AgentToolUpdateCallback } from "@mariozechner/pi-coding-agent";
 export type SearchMode = "fast" | "deep";
 export type SearchFreshness = "cached" | "live";
 export type DefuddleMode = "off" | "direct" | "fallback" | "both";
+export type CodexFailureKind =
+  | "transport"
+  | "auth"
+  | "rate_limit"
+  | "timeout"
+  | "budget"
+  | "schema"
+  | "empty_result"
+  | "cancelled"
+  | "missing_cli"
+  | "local_config"
+  | "unknown";
 
 export interface WebSearchInput {
   query: string;
@@ -22,6 +34,12 @@ export interface CodexWebSearchOutput {
   sources: WebSearchSource[];
 }
 
+export interface CodexFailureDetails {
+  kind: CodexFailureKind;
+  message: string;
+  recoverable: boolean;
+}
+
 export interface WebSearchProgressDetails {
   query: string;
   mode: SearchMode;
@@ -30,6 +48,7 @@ export interface WebSearchProgressDetails {
   searchQueries: string[];
   latestQuery?: string;
   statusText?: string;
+  statusEvents: string[];
 }
 
 export interface RetryProvenance {
@@ -53,6 +72,7 @@ export interface CodexWebSearchDetails extends WebSearchProgressDetails {
   fullOutputPath?: string;
   retry?: RetryProvenance;
   defuddle?: DefuddleProvenance;
+  failure?: CodexFailureDetails;
 }
 
 export interface WebSearchSettings {

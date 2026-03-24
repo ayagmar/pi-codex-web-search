@@ -487,9 +487,54 @@ void test("executeCodexWebSearch does not use Defuddle fallback for generic URL 
     });
   };
 
+  const result = await executeCodexWebSearch(
+    { query: "compare this page https://developers.openai.com/codex/cli/features" },
+    {
+      cwd: process.cwd(),
+      runner,
+      defuddleRunner,
+      settings: {
+        ...DEFAULT_WEB_SEARCH_SETTINGS,
+        defuddleMode: "both",
+      },
+    }
+  );
+
+  assert.equal(defuddleInvoked, false);
+  assert.equal(result.details.mode, "deep");
+  assert.equal(result.details.freshness, "live");
+  assert.equal(result.details.failure?.kind, "timeout");
+  assert.deepEqual(result.details.retry, {
+    retriedFromFast: true,
+    originalMode: "fast",
+    originalFreshness: "cached",
+    fallbackReason: "Codex web search timed out after 90 seconds.",
+  });
+  assert.match(result.content[0]?.text ?? "", /could not produce a usable result/i);
+});
+
+void test("executeCodexWebSearch does not hide terminal auth failures behind Defuddle fallback", async () => {
+  const runner: RunCodexCommand = () =>
+    Promise.reject(new Error("authentication required; run codex login"));
+
+  let defuddleInvoked = false;
+  const defuddleRunner: RunDefuddleCommand = () => {
+    defuddleInvoked = true;
+    return Promise.resolve({
+      url: "https://developers.openai.com/codex/cli/features",
+      title: "Features – Codex CLI | OpenAI Developers",
+      description: "Overview of functionality in the Codex terminal client",
+      domain: "developers.openai.com",
+      author: "",
+      published: "",
+      wordCount: 1234,
+      content: "Codex supports workflows beyond chat.",
+    });
+  };
+
   await assert.rejects(
     executeCodexWebSearch(
-      { query: "compare this page https://developers.openai.com/codex/cli/features" },
+      { query: "summarize https://developers.openai.com/codex/cli/features" },
       {
         cwd: process.cwd(),
         runner,
@@ -500,7 +545,7 @@ void test("executeCodexWebSearch does not use Defuddle fallback for generic URL 
         },
       }
     ),
-    /timed out/
+    /authentication required|codex login/
   );
 
   assert.equal(defuddleInvoked, false);
@@ -915,19 +960,21 @@ void test("executeCodexWebSearch counts repeated identical searches against the 
     );
   };
 
-  await assert.rejects(
-    executeCodexWebSearch(
-      { query: "weather in Tokyo", mode: "fast" },
-      {
-        cwd: process.cwd(),
-        runner,
-      }
-    ),
-    /11\/10 queries/
+  const result = await executeCodexWebSearch(
+    { query: "weather in Tokyo", mode: "fast" },
+    {
+      cwd: process.cwd(),
+      runner,
+    }
   );
+
+  assert.equal(result.details.failure?.kind, "budget");
+  assert.equal(result.details.searchCount, 11);
+  assert.deepEqual(result.details.searchQueries, ["same query"]);
+  assert.match(result.content[0]?.text ?? "", /11\/10 queries/);
 });
 
-void test("executeCodexWebSearch aborts explicit fast mode when Codex exceeds the search budget", async () => {
+void test("executeCodexWebSearch soft-fails explicit fast mode when Codex exceeds the search budget", async () => {
   const runner: RunCodexCommand = ({ onStdoutLine, signal }) => {
     for (let i = 1; i <= 11; i += 1) {
       onStdoutLine?.(
@@ -954,19 +1001,20 @@ void test("executeCodexWebSearch aborts explicit fast mode when Codex exceeds th
     );
   };
 
-  await assert.rejects(
-    executeCodexWebSearch(
-      { query: "weather in Tokyo", mode: "fast" },
-      {
-        cwd: process.cwd(),
-        runner,
-      }
-    ),
-    /fast search budget/
+  const result = await executeCodexWebSearch(
+    { query: "weather in Tokyo", mode: "fast" },
+    {
+      cwd: process.cwd(),
+      runner,
+    }
   );
+
+  assert.equal(result.details.failure?.kind, "budget");
+  assert.equal(result.details.searchCount, 11);
+  assert.match(result.content[0]?.text ?? "", /fast search budget/);
 });
 
-void test("executeCodexWebSearch blocks repeated fast retries within the same turn", async () => {
+void test("executeCodexWebSearch soft-fails repeated fast retries within the same turn", async () => {
   const turnState = { fastModeExhausted: true };
   let invoked = false;
   const runner: RunCodexCommand = () => {
@@ -974,19 +1022,299 @@ void test("executeCodexWebSearch blocks repeated fast retries within the same tu
     return Promise.resolve({ code: 0, stdout: "", stderr: "" });
   };
 
-  await assert.rejects(
-    executeCodexWebSearch(
-      { query: "did sentinels win today" },
-      {
-        cwd: process.cwd(),
-        runner,
-        turnState,
-      }
-    ),
-    /Do not retry fast mode in the same turn/
+  const result = await executeCodexWebSearch(
+    { query: "did sentinels win today" },
+    {
+      cwd: process.cwd(),
+      runner,
+      turnState,
+    }
   );
 
   assert.equal(invoked, false);
+  assert.equal(result.details.failure?.kind, "budget");
+  assert.match(result.content[0]?.text ?? "", /failed earlier in this turn/i);
+});
+
+void test("executeCodexWebSearch retries turn.failed transport failures and surfaces progress", async () => {
+  const statusTexts: string[] = [];
+  let attempts = 0;
+
+  const runner: RunCodexCommand = ({ args, onStdoutLine }) => {
+    attempts += 1;
+
+    if (attempts === 1) {
+      const stdoutLines = [
+        JSON.stringify({
+          type: "item.completed",
+          item: {
+            type: "error",
+            message: "Falling back from WebSockets to HTTPS transport. upstream reset",
+          },
+        }),
+        JSON.stringify({
+          type: "error",
+          message: "Reconnecting... 1/2",
+        }),
+        JSON.stringify({
+          type: "turn.failed",
+          error: {
+            message: "stream disconnected before completion: error sending request",
+          },
+        }),
+      ];
+
+      for (const line of stdoutLines) {
+        onStdoutLine?.(line);
+      }
+
+      return Promise.resolve({
+        code: 1,
+        stdout: stdoutLines.join("\n"),
+        stderr: "",
+      });
+    }
+
+    const outputPath = args[args.indexOf("--output-last-message") + 1];
+    assert.ok(outputPath);
+    return writeFile(
+      outputPath,
+      JSON.stringify({
+        summary: "Recovered after a transport retry.",
+        sources: [],
+      })
+    ).then(() => ({ code: 0, stdout: "", stderr: "" }));
+  };
+
+  const result = await executeCodexWebSearch(
+    { query: "latest codex transport status" },
+    {
+      cwd: process.cwd(),
+      runner,
+      onUpdate: (update) => {
+        const details = update.details as { statusText?: string } | undefined;
+        statusTexts.push(details?.statusText ?? "");
+      },
+    }
+  );
+
+  assert.equal(attempts, 2);
+  assert.equal(result.details.mode, "deep");
+  assert.equal(result.details.freshness, "live");
+  assert.equal(result.details.retry?.retriedFromFast, true);
+  assert.match(result.details.retry?.fallbackReason ?? "", /stream disconnected before completion/);
+  assert.ok(
+    statusTexts.some((line) => line.includes("Falling back from WebSockets to HTTPS transport"))
+  );
+  assert.ok(statusTexts.some((line) => line.includes("Reconnecting... 1/2")));
+  assert.match(result.content[0]?.text ?? "", /Recovered after a transport retry\./);
+});
+
+void test("executeCodexWebSearch does not poison later fast searches after a recovered transport failure", async () => {
+  const turnState = { fastModeExhausted: false };
+  let attempts = 0;
+
+  const runner: RunCodexCommand = ({ args, onStdoutLine }) => {
+    attempts += 1;
+
+    if (attempts === 1) {
+      const stdoutLines = [
+        JSON.stringify({
+          type: "turn.failed",
+          error: {
+            message: "stream disconnected before completion: error sending request",
+          },
+        }),
+      ];
+      for (const line of stdoutLines) {
+        onStdoutLine?.(line);
+      }
+      return Promise.resolve({ code: 1, stdout: stdoutLines.join("\n"), stderr: "" });
+    }
+
+    const outputPath = args[args.indexOf("--output-last-message") + 1];
+    assert.ok(outputPath);
+    const summary =
+      attempts === 2 ? "Recovered on deep/live retry." : "Later fast search still works.";
+    return writeFile(outputPath, JSON.stringify({ summary, sources: [] })).then(() => ({
+      code: 0,
+      stdout: "",
+      stderr: "",
+    }));
+  };
+
+  const first = await executeCodexWebSearch(
+    { query: "first transport hiccup" },
+    {
+      cwd: process.cwd(),
+      runner,
+      turnState,
+    }
+  );
+  const second = await executeCodexWebSearch(
+    { query: "second fast lookup", mode: "fast" },
+    {
+      cwd: process.cwd(),
+      runner,
+      turnState,
+    }
+  );
+
+  assert.equal(first.details.mode, "deep");
+  assert.equal(turnState.fastModeExhausted, false);
+  assert.equal(second.details.mode, "fast");
+  assert.match(second.content[0]?.text ?? "", /Later fast search still works\./);
+});
+
+void test("executeCodexWebSearch does not poison later fast searches after a recovered timeout", async () => {
+  const turnState = { fastModeExhausted: false };
+  let attempts = 0;
+
+  const runner: RunCodexCommand = ({ args }) => {
+    attempts += 1;
+
+    if (attempts === 1) {
+      return Promise.reject(new Error("Codex web search timed out after 90 seconds."));
+    }
+
+    const outputPath = args[args.indexOf("--output-last-message") + 1];
+    assert.ok(outputPath);
+    const summary =
+      attempts === 2
+        ? "Recovered after timeout retry."
+        : "Later fast search still works after timeout.";
+    return writeFile(outputPath, JSON.stringify({ summary, sources: [] })).then(() => ({
+      code: 0,
+      stdout: "",
+      stderr: "",
+    }));
+  };
+
+  const first = await executeCodexWebSearch(
+    { query: "first timeout" },
+    {
+      cwd: process.cwd(),
+      runner,
+      turnState,
+    }
+  );
+  const second = await executeCodexWebSearch(
+    { query: "second fast lookup", mode: "fast" },
+    {
+      cwd: process.cwd(),
+      runner,
+      turnState,
+    }
+  );
+
+  assert.equal(first.details.mode, "deep");
+  assert.equal(turnState.fastModeExhausted, false);
+  assert.equal(second.details.mode, "fast");
+  assert.match(second.content[0]?.text ?? "", /Later fast search still works after timeout\./);
+});
+
+void test("executeCodexWebSearch blocks later fast searches after an unrecovered timeout", async () => {
+  const turnState = { fastModeExhausted: false };
+  let attempts = 0;
+
+  const runner: RunCodexCommand = () => {
+    attempts += 1;
+
+    if (attempts === 1) {
+      return Promise.reject(new Error("Codex web search timed out after 90 seconds."));
+    }
+
+    return Promise.reject(new Error("Codex still timed out after retry."));
+  };
+
+  const first = await executeCodexWebSearch(
+    { query: "first timeout" },
+    {
+      cwd: process.cwd(),
+      runner,
+      turnState,
+    }
+  );
+  const second = await executeCodexWebSearch(
+    { query: "second fast lookup", mode: "fast" },
+    {
+      cwd: process.cwd(),
+      runner,
+      turnState,
+    }
+  );
+
+  assert.equal(first.details.failure?.kind, "timeout");
+  assert.equal(turnState.fastModeExhausted, true);
+  assert.equal(second.details.failure?.kind, "budget");
+  assert.equal(attempts, 2);
+});
+
+void test("executeCodexWebSearch classifies common backend 5xx failures as transport", async () => {
+  const runner: RunCodexCommand = () =>
+    Promise.reject(
+      new Error(
+        "503 Service Unavailable: upstream connect error or disconnect/reset before headers"
+      )
+    );
+
+  const result = await executeCodexWebSearch(
+    { query: "backend outage", mode: "deep" },
+    {
+      cwd: process.cwd(),
+      runner,
+    }
+  );
+
+  assert.equal(result.details.failure?.kind, "transport");
+  assert.match(result.content[0]?.text ?? "", /Failure kind: transport/);
+});
+
+void test("executeCodexWebSearch returns a soft degraded result for blank output plus turn.failed", async () => {
+  const runner: RunCodexCommand = ({ args, onStdoutLine }) => {
+    const outputPath = args[args.indexOf("--output-last-message") + 1];
+    assert.ok(outputPath);
+
+    const stdoutLines = [
+      JSON.stringify({
+        type: "error",
+        message: "Reconnecting... 2/2",
+      }),
+      JSON.stringify({
+        type: "turn.failed",
+        error: {
+          message: "stream disconnected before completion: error sending request",
+        },
+      }),
+    ];
+
+    for (const line of stdoutLines) {
+      onStdoutLine?.(line);
+    }
+
+    return writeFile(outputPath, "   \n").then(() => ({
+      code: 0,
+      stdout: stdoutLines.join("\n"),
+      stderr: "",
+    }));
+  };
+
+  const result = await executeCodexWebSearch(
+    { query: "transport failure trace", mode: "deep" },
+    {
+      cwd: process.cwd(),
+      runner,
+    }
+  );
+
+  assert.equal(result.details.mode, "deep");
+  assert.equal(result.details.failure?.kind, "transport");
+  assert.deepEqual(result.details.statusEvents, [
+    "Reconnecting... 2/2",
+    "stream disconnected before completion: error sending request",
+  ]);
+  assert.match(result.content[0]?.text ?? "", /could not produce a usable result/i);
+  assert.doesNotMatch(result.content[0]?.text ?? "", /Sources: none provided by Codex\./);
 });
 
 void test("executeCodexWebSearch surfaces codex execution failures", async () => {

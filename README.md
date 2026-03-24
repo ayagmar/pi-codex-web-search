@@ -99,10 +99,10 @@ Behavior:
 - supports explicit `cached`/`live` freshness overrides
 - keeps `cached` as the default for normal fast lookups and only auto-promotes to `live` for strong recency cues like `today`, `latest`, `current`, `now`, `weather`, `price`, `breaking`, and `urgent`
 - uses Defuddle immediately when the query is just a URL (including `https://defuddle.md/<url>` mirrors) when `defuddle-mode` allows direct extraction
-- automatically retries one retryable default fast search as `deep` + `live` when Codex times out, burns through the fast query budget, or fails to emit a usable final response
-- shows the escalation clearly in tool progress/details when that retry happens
+- automatically retries one recoverable default fast search as `deep` + `live` when Codex times out, burns through the fast query budget, loses transport, or fails to emit a usable final response
+- shows reconnects, WebSocket-to-HTTPS fallback, and the final classified failure cause in tool progress/details when they happen
 - can fall back to Defuddle for single-URL extraction-style requests when Codex still fails after its own retries, if `defuddle-mode` enables fallback
-- falls back to Codex's final JSONL agent message if `--output-last-message` comes back empty
+- falls back to Codex's final JSONL agent message if `--output-last-message` comes back empty, and treats `turn.failed` / `error` JSONL events as first-class failure signals
 - enforces smaller time/query budgets in fast mode so lightweight lookups do not run indefinitely
 - warns when fast mode has consumed its full query budget and is about to fail or auto-escalate
 - blocks repeated fast-mode retries within the same turn after fast mode has already been exhausted
@@ -111,7 +111,7 @@ Behavior:
 - returns a compact answer with sources
 - truncates oversized output and saves the full result to a temp file when needed
 - surfaces clearer Codex auth guidance, including `codex login status` and `codex login`, when authentication appears to be missing or expired
-- fails clearly if `codex` is missing or `codex exec` fails
+- soft-degrades recoverable Codex failures so Pi can keep going, while still failing clearly for missing `codex`, bad local config, cancellations, and auth problems
 
 ## Settings
 

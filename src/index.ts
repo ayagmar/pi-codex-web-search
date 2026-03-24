@@ -23,6 +23,7 @@ import {
   saveSettings,
 } from "./settings.js";
 import type {
+  CodexFailureDetails,
   CodexWebSearchDetails,
   DefuddleMode,
   ExecuteCodexWebSearchOptions,
@@ -137,9 +138,12 @@ export default function codexWebSearchExtension(pi: ExtensionAPI) {
         return new Text(statusLine, 0, 0);
       }
 
+      const failed = !!details.failure;
       let text = theme.fg(
-        "success",
-        `✓ ${details.sourceCount} source${details.sourceCount === 1 ? "" : "s"}`
+        failed ? "warning" : "success",
+        failed
+          ? `⚠ ${formatFailureLabel(details.failure!)}`
+          : `✓ ${details.sourceCount} source${details.sourceCount === 1 ? "" : "s"}`
       );
       text += theme.fg(
         "muted",
@@ -159,8 +163,10 @@ export default function codexWebSearchExtension(pi: ExtensionAPI) {
       }
 
       if (!expanded) {
-        text += theme.fg("dim", ` (${keyHint("expandTools", "to expand")})`);
-        if (details.latestQuery) {
+        text += theme.fg("dim", ` (${keyHint("app.tools.expand", "to expand")})`);
+        if (details.failure) {
+          text += `\n${theme.fg("dim", formatInlineQuery(details.failure.message, 110))}`;
+        } else if (details.latestQuery) {
           text += `\n${theme.fg("dim", `Last query: ${formatInlineQuery(details.latestQuery, 110)}`)}`;
         }
         if (details.defuddle?.urls[0]) {
@@ -174,9 +180,19 @@ export default function codexWebSearchExtension(pi: ExtensionAPI) {
         text += `\n${theme.fg("warning", formatRetrySummary(details.retry))}`;
         text += `\n${theme.fg("dim", details.retry.fallbackReason)}`;
       }
+      if (details.failure) {
+        text += `\n${theme.fg("warning", `Failure kind: ${details.failure.kind}`)}`;
+        text += `\n${theme.fg("dim", details.failure.message)}`;
+      }
       if (details.defuddle) {
         text += `\n${theme.fg("warning", details.defuddle.directUrlQuery ? "Used Defuddle for direct URL extraction" : "Used Defuddle after Codex failed")}`;
         text += `\n${theme.fg("dim", details.defuddle.reason)}`;
+      }
+      if (details.statusEvents.length > 0) {
+        text += `\n${theme.fg("muted", `Codex events (${details.statusEvents.length}):`)}`;
+        for (const [index, status] of details.statusEvents.entries()) {
+          text += `\n${theme.fg("dim", `  ${index + 1}. ${status}`)}`;
+        }
       }
       if (details.searchQueries.length > 0) {
         text += `\n${theme.fg("muted", `Queries (${details.searchQueries.length}):`)}`;
@@ -669,6 +685,7 @@ function hasRenderableResultDetails(
     typeof details.sourceCount === "number" &&
     typeof details.searchCount === "number" &&
     Array.isArray(details.searchQueries) &&
+    Array.isArray(details.statusEvents) &&
     Array.isArray(details.sources) &&
     typeof details.summary === "string" &&
     typeof details.truncated === "boolean"
@@ -686,6 +703,7 @@ function renderProgress(
   const mode = details?.mode ?? "fast";
   const freshness = details?.freshness ?? "cached";
   const statusText = details?.statusText ?? "Searching the web";
+  const statusEvents = details?.statusEvents ?? [];
 
   let text = theme.fg("warning", statusText);
   text += theme.fg(
@@ -694,23 +712,54 @@ function renderProgress(
   );
 
   if (!expanded) {
-    text += theme.fg("dim", ` (${keyHint("expandTools", "to expand")})`);
-    if (details?.latestQuery) {
+    text += theme.fg("dim", ` (${keyHint("app.tools.expand", "to expand")})`);
+    if (statusEvents.length > 0) {
+      text += `\n${theme.fg("dim", formatInlineQuery(statusEvents[statusEvents.length - 1], 110))}`;
+    } else if (details?.latestQuery) {
       text += `\n${theme.fg("dim", `Latest: ${formatInlineQuery(details.latestQuery, 110)}`)}`;
     }
     return text;
   }
 
+  if (statusEvents.length > 0) {
+    text += `\n${theme.fg("muted", `Codex events (${statusEvents.length}):`)}`;
+    for (const [index, status] of statusEvents.entries()) {
+      text += `\n${theme.fg("dim", `  ${index + 1}. ${status}`)}`;
+    }
+  }
+
   if (!details || details.searchQueries.length === 0) {
-    text += `\n${theme.fg("dim", "Waiting for Codex to emit search queries...")}`;
+    if (statusEvents.length === 0) {
+      text += `\n${theme.fg("dim", "Waiting for Codex to emit search queries...")}`;
+    }
     return text;
   }
 
-  text += `\n${theme.fg("muted", "Queries:")}`;
+  text += `\n${theme.fg("muted", `Queries (${details.searchQueries.length}):`)}`;
   for (const [index, query] of details.searchQueries.entries()) {
     text += `\n${theme.fg("dim", `  ${index + 1}. ${query}`)}`;
   }
   return text;
+}
+
+function formatFailureLabel(failure: CodexFailureDetails): string {
+  switch (failure.kind) {
+    case "transport":
+      return "Web search transport issue";
+    case "rate_limit":
+      return "Web search rate-limited";
+    case "timeout":
+      return "Web search timed out";
+    case "budget":
+      return "Web search budget exhausted";
+    case "schema":
+    case "empty_result":
+      return "Web search returned no usable result";
+    case "auth":
+      return "Web search authentication issue";
+    default:
+      return "Web search degraded";
+  }
 }
 
 function formatRetrySummary(retry: RetryProvenance): string {
@@ -720,6 +769,16 @@ function formatRetrySummary(retry: RetryProvenance): string {
 
   if (/timed out/i.test(retry.fallbackReason)) {
     return `Auto-escalated to deep/live after fast/${retry.originalFreshness} timed out`;
+  }
+
+  if (
+    /reconnect|reconnecting|websocket|transport|stream disconnected/i.test(retry.fallbackReason)
+  ) {
+    return `Auto-escalated to deep/live after fast/${retry.originalFreshness} lost its Codex transport`;
+  }
+
+  if (/rate limit|too many requests|quota|429/i.test(retry.fallbackReason)) {
+    return `Auto-escalated to deep/live after fast/${retry.originalFreshness} hit a rate limit`;
   }
 
   return `Retried as deep/live after fast/${retry.originalFreshness} failed`;
