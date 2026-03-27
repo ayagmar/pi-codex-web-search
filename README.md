@@ -10,7 +10,7 @@ It is designed for the case where:
 
 ## How it works
 
-When Pi calls `web_search`, the extension runs Codex non-interactively:
+When Pi calls `web_search`, the extension auto-resolves a usable Codex binary, then runs Codex non-interactively:
 
 - `codex exec --json`
 - `-c web_search="cached"` or `-c web_search="live"`
@@ -37,8 +37,11 @@ The extension then:
 ## Requirements
 
 - Node.js 22+
-- `codex` available in `PATH`
 - authenticated Codex CLI session
+- Codex CLI either:
+  - available in `PATH`, or
+  - installed in a common npm location the extension can auto-detect, or
+  - pointed to explicitly with `PI_CODEX_WEB_SEARCH_CODEX_PATH`
 
 Check your Codex auth state with:
 
@@ -102,7 +105,9 @@ Behavior:
 - automatically retries one recoverable default fast search as `deep` + `live` when Codex times out, burns through the fast query budget, loses transport, or fails to emit a usable final response
 - shows reconnects, WebSocket-to-HTTPS fallback, and the final classified failure cause in tool progress/details when they happen
 - can fall back to Defuddle for single-URL extraction-style requests when Codex still fails after its own retries, if `defuddle-mode` enables fallback
-- falls back to Codex's final JSONL agent message if `--output-last-message` comes back empty, and treats `turn.failed` / `error` JSONL events as first-class failure signals
+- falls back to Codex's final JSONL agent message if `--output-last-message` comes back empty, including newer raw `response.output_item.*` assistant events as a compatibility path
+- tolerates fenced or wrapped JSON when Codex produces the right object with extra surrounding text
+- treats `turn.failed`, `response.*.failed`, and `error` JSONL events as first-class failure signals
 - enforces smaller time/query budgets in fast mode so lightweight lookups do not run indefinitely
 - warns when fast mode has consumed its full query budget and is about to fail or auto-escalate
 - blocks repeated fast-mode retries within the same turn after fast mode has already been exhausted

@@ -1,4 +1,3 @@
-import { spawn } from "node:child_process";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import {
   DEFAULT_MAX_BYTES,
@@ -17,6 +16,7 @@ import {
   getDirectUrlQuery,
   runDefuddleCommand,
 } from "./defuddle.js";
+import { runCodexCommand } from "./codex-command.js";
 import { DEFAULT_WEB_SEARCH_SETTINGS } from "./settings.js";
 import type {
   CodexFailureDetails,
@@ -52,11 +52,24 @@ interface ResolvedWebSearchInput {
   freshness: SearchFreshness;
 }
 
+interface LooseWebSearchSource {
+  title?: string;
+  url: string;
+  snippet?: string;
+}
+
+interface LooseCodexWebSearchOutput {
+  summary: string;
+  sources: LooseWebSearchSource[];
+}
+
 interface CodexJsonlSummary {
   finalAgentMessage?: string;
   turnFailedMessage?: string;
   errorMessages: string[];
 }
+
+export { findBundledCodexExecutable, runCodexCommand } from "./codex-command.js";
 
 class CodexWebSearchFailure extends Error {
   readonly failure: CodexFailureDetails;
@@ -228,14 +241,7 @@ export function buildCodexExecArgs(
 }
 
 export function parseCodexWebSearchOutput(raw: string, maxSources: number): CodexWebSearchOutput {
-  let parsed: unknown;
-
-  try {
-    parsed = JSON.parse(raw);
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    throw new Error(`Codex returned invalid JSON: ${message}`);
-  }
+  const parsed = parseJsonObjectText(raw, "Codex returned invalid JSON");
 
   if (!isCodexWebSearchOutput(parsed)) {
     throw new Error("Codex returned JSON that does not match the expected web search schema.");
@@ -813,11 +819,11 @@ async function readFinalCodexOutput(outputPath: string, stdout: string): Promise
     }
   }
 
+  const summary = summarizeCodexStdout(stdout);
   if (rawOutput.trim()) {
-    return rawOutput;
+    return extractJsonObjectCandidate(rawOutput) ?? summary.finalAgentMessage ?? rawOutput;
   }
 
-  const summary = summarizeCodexStdout(stdout);
   if (summary.finalAgentMessage) {
     return summary.finalAgentMessage;
   }
@@ -850,7 +856,7 @@ function summarizeCodexStdout(stdout: string): CodexJsonlSummary {
     const errorMessage = extractErrorMessageFromEvent(event);
     if (errorMessage) {
       errorMessages.push(errorMessage);
-      if (event.type === "turn.failed") {
+      if (typeof event.type === "string" && /(?:^|\.)failed$/u.test(event.type)) {
         turnFailedMessage = errorMessage;
       }
     }
@@ -864,21 +870,38 @@ function summarizeCodexStdout(stdout: string): CodexJsonlSummary {
 }
 
 function extractFinalAgentMessageFromEvent(event: Record<string, unknown>): string | undefined {
-  if (event.type !== "item.completed") {
+  const item = extractEventItem(event);
+  if (item) {
+    const directMessage = extractAssistantMessageTextFromItem(item);
+    if (directMessage) {
+      return directMessage;
+    }
+  }
+
+  const response = event.response;
+  if (!response || typeof response !== "object") {
     return undefined;
   }
 
-  const item = event.item;
-  if (!item || typeof item !== "object") {
+  const output = (response as { output?: unknown }).output;
+  if (!Array.isArray(output)) {
     return undefined;
   }
 
-  const typedItem = item as { type?: unknown; text?: unknown };
-  if (typedItem.type !== "agent_message" || typeof typedItem.text !== "string") {
-    return undefined;
+  const items = output as unknown[];
+  for (let index = items.length - 1; index >= 0; index -= 1) {
+    const item = items[index];
+    if (!item || typeof item !== "object") {
+      continue;
+    }
+
+    const message = extractAssistantMessageTextFromItem(item as Record<string, unknown>);
+    if (message) {
+      return message;
+    }
   }
 
-  return typedItem.text.trim() || undefined;
+  return undefined;
 }
 
 function extractErrorMessageFromEvent(event: Record<string, unknown>): string | undefined {
@@ -886,32 +909,76 @@ function extractErrorMessageFromEvent(event: Record<string, unknown>): string | 
     return event.message.trim() || undefined;
   }
 
-  if (event.type === "turn.failed") {
-    const error = event.error;
-    if (
-      error &&
-      typeof error === "object" &&
-      typeof (error as { message?: unknown }).message === "string"
-    ) {
-      return (error as { message: string }).message.trim() || undefined;
+  if (typeof event.type === "string" && /(?:^|\.)failed$/u.test(event.type)) {
+    const failedMessage = extractMessageField(event.error);
+    if (failedMessage) {
+      return failedMessage;
     }
+  }
+
+  const item = extractEventItem(event);
+  if (!item) {
     return undefined;
   }
 
-  if (
-    (event.type === "item.started" ||
-      event.type === "item.updated" ||
-      event.type === "item.completed") &&
-    event.item &&
-    typeof event.item === "object"
-  ) {
-    const item = event.item as { type?: unknown; message?: unknown };
-    if (item.type === "error" && typeof item.message === "string") {
-      return item.message.trim() || undefined;
-    }
+  if (item.type === "error" && typeof item.message === "string") {
+    return item.message.trim() || undefined;
   }
 
-  return undefined;
+  return extractMessageField((item as { error?: unknown }).error);
+}
+
+function extractEventItem(event: Record<string, unknown>): Record<string, unknown> | undefined {
+  if (
+    !event.item ||
+    typeof event.item !== "object" ||
+    typeof event.type !== "string" ||
+    (!event.type.startsWith("item.") && !event.type.startsWith("response.output_item."))
+  ) {
+    return undefined;
+  }
+
+  return event.item as Record<string, unknown>;
+}
+
+function extractAssistantMessageTextFromItem(item: Record<string, unknown>): string | undefined {
+  if (item.type === "agent_message" && typeof item.text === "string") {
+    return item.text.trim() || undefined;
+  }
+
+  if (item.type !== "message" || item.role !== "assistant" || !Array.isArray(item.content)) {
+    return undefined;
+  }
+
+  const text = item.content.map(extractAssistantContentText).join("");
+  return text.trim() || undefined;
+}
+
+function extractAssistantContentText(value: unknown): string {
+  if (!value || typeof value !== "object") {
+    return "";
+  }
+
+  const typedValue = value as { type?: unknown; text?: unknown };
+  if (
+    (typedValue.type === "output_text" || typedValue.type === "text") &&
+    typeof typedValue.text === "string"
+  ) {
+    return typedValue.text;
+  }
+
+  return "";
+}
+
+function extractMessageField(value: unknown): string | undefined {
+  if (!value || typeof value !== "object") {
+    return undefined;
+  }
+
+  const typedValue = value as { message?: unknown };
+  return typeof typedValue.message === "string"
+    ? typedValue.message.trim() || undefined
+    : undefined;
 }
 
 function shouldRetryWithDeepLiveSearch(
@@ -1005,16 +1072,16 @@ function buildCodexFailure(result: RunCodexCommandResult): CodexFailureDetails {
 }
 
 function classifyFailureText(message: string): CodexFailureDetails {
-  if (needsCodexAuthHelp(message)) {
-    return createCodexFailure("auth", message, false);
-  }
-
-  if (/could not find `codex` in path/i.test(message)) {
+  if (/could not find `codex` in path|common install locations/i.test(message)) {
     return createCodexFailure("missing_cli", message, false);
   }
 
   if (/failed to start codex cli|invalid .*config|config error/i.test(message)) {
     return createCodexFailure("local_config", message, false);
+  }
+
+  if (needsCodexAuthHelp(message)) {
+    return createCodexFailure("auth", message, false);
   }
 
   if (/\bcancel(?:led|ed)?\b|abort(?:ed)?/i.test(message)) {
@@ -1054,101 +1121,6 @@ function classifyFailureText(message: string): CodexFailureDetails {
   }
 
   return createCodexFailure("unknown", message, false);
-}
-
-export async function runCodexCommand(
-  options: RunCodexCommandOptions
-): Promise<RunCodexCommandResult> {
-  return new Promise<RunCodexCommandResult>((resolve, reject) => {
-    const child = spawn("codex", options.args, {
-      cwd: options.cwd,
-      stdio: ["pipe", "pipe", "pipe"],
-      env: process.env,
-    });
-
-    let stdout = "";
-    let stderr = "";
-    let stdoutLineBuffer = "";
-    let settled = false;
-    let timeoutId: NodeJS.Timeout | undefined;
-
-    const finish = (callback: () => void): void => {
-      if (settled) return;
-      settled = true;
-      if (timeoutId) clearTimeout(timeoutId);
-      options.signal?.removeEventListener("abort", onAbort);
-      callback();
-    };
-
-    const onAbort = (): void => {
-      child.kill("SIGTERM");
-      const reason: unknown = options.signal?.reason;
-      const error =
-        reason instanceof Error
-          ? reason
-          : new Error(typeof reason === "string" ? reason : "Codex web search was cancelled.");
-      finish(() => reject(error));
-    };
-
-    if (options.signal?.aborted) {
-      onAbort();
-      return;
-    }
-
-    if (options.timeoutMs !== undefined) {
-      const timeoutMs = options.timeoutMs;
-      timeoutId = setTimeout(() => {
-        child.kill("SIGTERM");
-        finish(() => {
-          reject(
-            new Error(`Codex web search timed out after ${Math.ceil(timeoutMs / 1000)} seconds.`)
-          );
-        });
-      }, timeoutMs);
-    }
-
-    options.signal?.addEventListener("abort", onAbort, { once: true });
-
-    child.on("error", (error) => {
-      const message =
-        (error as NodeJS.ErrnoException).code === "ENOENT"
-          ? "Could not find `codex` in PATH. Install Codex CLI, then run `codex login status` or `codex login`."
-          : `Failed to start Codex CLI: ${error.message}`;
-      finish(() => reject(new Error(message)));
-    });
-
-    child.stdout.setEncoding("utf-8");
-    child.stdout.on("data", (chunk: string) => {
-      stdout += chunk;
-      stdoutLineBuffer += chunk;
-
-      let newlineIndex = stdoutLineBuffer.indexOf("\n");
-      while (newlineIndex >= 0) {
-        const line = stdoutLineBuffer.slice(0, newlineIndex);
-        options.onStdoutLine?.(line);
-        stdoutLineBuffer = stdoutLineBuffer.slice(newlineIndex + 1);
-        newlineIndex = stdoutLineBuffer.indexOf("\n");
-      }
-    });
-
-    child.stderr.setEncoding("utf-8");
-    child.stderr.on("data", (chunk: string) => {
-      stderr += chunk;
-    });
-
-    child.on("close", (code) => {
-      if (stdoutLineBuffer) {
-        options.onStdoutLine?.(stdoutLineBuffer);
-      }
-      finish(() => resolve({ code: code ?? 1, stdout, stderr }));
-    });
-
-    if (options.stdin !== undefined) {
-      child.stdin.end(options.stdin);
-    } else {
-      child.stdin.end();
-    }
-  });
 }
 
 function tailLines(text: string, count: number): string {
@@ -1376,13 +1348,93 @@ function parseJsonObject(line: string): Record<string, unknown> | undefined {
   }
 }
 
-function extractSearchQueries(event: Record<string, unknown>): string[] {
-  if (typeof event.type !== "string" || !event.type.startsWith("item.")) {
-    return [];
+function parseJsonObjectText(raw: string, errorPrefix: string): Record<string, unknown> {
+  const candidate = extractJsonObjectCandidate(raw) ?? raw.trim();
+
+  try {
+    const parsed: unknown = JSON.parse(candidate);
+    if (parsed && typeof parsed === "object") {
+      return parsed as Record<string, unknown>;
+    }
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    throw new Error(`${errorPrefix}: ${message}`);
   }
 
-  const item = event.item;
-  if (!item || typeof item !== "object") return [];
+  throw new Error(`${errorPrefix}: expected a JSON object.`);
+}
+
+function extractJsonObjectCandidate(raw: string): string | undefined {
+  const trimmed = raw.trim();
+  if (!trimmed) {
+    return undefined;
+  }
+
+  const fencedMatch = trimmed.match(/```(?:json)?\s*([\s\S]*?)```/iu);
+  const fenced = fencedMatch?.[1]?.trim();
+  if (fenced) {
+    return extractJsonObjectCandidate(fenced) ?? fenced;
+  }
+
+  if (trimmed.startsWith("{") && trimmed.endsWith("}")) {
+    return trimmed;
+  }
+
+  const firstBrace = trimmed.indexOf("{");
+  if (firstBrace < 0) {
+    return undefined;
+  }
+
+  let depth = 0;
+  let inString = false;
+  let escaping = false;
+
+  for (let index = firstBrace; index < trimmed.length; index += 1) {
+    const character = trimmed[index];
+    if (!character) {
+      continue;
+    }
+
+    if (escaping) {
+      escaping = false;
+      continue;
+    }
+
+    if (character === "\\") {
+      escaping = true;
+      continue;
+    }
+
+    if (character === '"') {
+      inString = !inString;
+      continue;
+    }
+
+    if (inString) {
+      continue;
+    }
+
+    if (character === "{") {
+      depth += 1;
+      continue;
+    }
+
+    if (character === "}") {
+      depth -= 1;
+      if (depth === 0) {
+        return trimmed.slice(firstBrace, index + 1);
+      }
+    }
+  }
+
+  return undefined;
+}
+
+function extractSearchQueries(event: Record<string, unknown>): string[] {
+  const item = extractEventItem(event);
+  if (!item) {
+    return [];
+  }
 
   const typedItem = item as {
     type?: unknown;
@@ -1411,12 +1463,32 @@ function extractSearchActionQueries(value: unknown): string[] {
     return [];
   }
 
-  const typedValue = value as { type?: unknown; query?: unknown; queries?: unknown };
-  if (typedValue.type !== undefined && typedValue.type !== "search") {
-    return [];
+  const typedValue = value as {
+    type?: unknown;
+    query?: unknown;
+    queries?: unknown;
+    url?: unknown;
+    pattern?: unknown;
+  };
+
+  if (typedValue.type === undefined || typedValue.type === "search") {
+    return [...extractQueryValues(typedValue.queries), ...extractQueryValues(typedValue.query)];
   }
 
-  return [...extractQueryValues(typedValue.queries), ...extractQueryValues(typedValue.query)];
+  if (typedValue.type === "open_page") {
+    return extractQueryValues(typedValue.url);
+  }
+
+  if (typedValue.type === "find_in_page") {
+    const url = extractQueryValues(typedValue.url)[0];
+    const pattern = extractQueryValues(typedValue.pattern)[0];
+    if (url && pattern) {
+      return [`${pattern} in ${url}`];
+    }
+    return [url, pattern].filter((query): query is string => !!query);
+  }
+
+  return [];
 }
 
 function extractQueryValues(value: unknown): string[] {
@@ -1445,7 +1517,7 @@ function dedupeQueries(queries: string[]): string[] {
   return uniqueQueries;
 }
 
-function isCodexWebSearchOutput(value: unknown): value is CodexWebSearchOutput {
+function isCodexWebSearchOutput(value: unknown): value is LooseCodexWebSearchOutput {
   if (!value || typeof value !== "object") return false;
   const candidate = value as { summary?: unknown; sources?: unknown };
   return (
@@ -1455,13 +1527,13 @@ function isCodexWebSearchOutput(value: unknown): value is CodexWebSearchOutput {
   );
 }
 
-function isWebSearchSource(value: unknown): value is WebSearchSource {
+function isWebSearchSource(value: unknown): value is LooseWebSearchSource {
   if (!value || typeof value !== "object") return false;
   const candidate = value as { title?: unknown; url?: unknown; snippet?: unknown };
   return (
-    typeof candidate.title === "string" &&
     typeof candidate.url === "string" &&
-    typeof candidate.snippet === "string"
+    (typeof candidate.title === "string" || candidate.title === undefined) &&
+    (typeof candidate.snippet === "string" || candidate.snippet === undefined)
   );
 }
 
@@ -1469,10 +1541,13 @@ function hasUsableSource(source: WebSearchSource): boolean {
   return source.title.length > 0 && source.url.length > 0;
 }
 
-function normalizeSource(source: WebSearchSource): WebSearchSource {
+function normalizeSource(source: LooseWebSearchSource): WebSearchSource {
+  const url = source.url.trim();
+  const title = source.title === undefined ? url : source.title.trim();
+
   return {
-    title: source.title.trim(),
-    url: source.url.trim(),
-    snippet: source.snippet.trim(),
+    title,
+    url,
+    snippet: source.snippet?.trim() ?? "",
   };
 }

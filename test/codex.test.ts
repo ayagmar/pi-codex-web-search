@@ -1,7 +1,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { rm, writeFile } from "node:fs/promises";
-import { dirname } from "node:path";
+import { chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
 import {
   buildCodexExecArgs,
   buildCodexPrompt,
@@ -14,6 +15,7 @@ import {
   resolveSearchFreshness,
   resolveSearchMode,
 } from "../src/codex.js";
+import { findBundledCodexExecutable } from "../src/codex-command.js";
 import { extractUrlsFromText, getDirectUrlQuery } from "../src/defuddle.js";
 import { DEFAULT_FAST_MAX_SOURCES, MAX_ALLOWED_SOURCES } from "../src/constants.js";
 import { DEFAULT_WEB_SEARCH_SETTINGS } from "../src/settings.js";
@@ -157,6 +159,29 @@ void test("buildCodexExecArgs configures the requested web-search freshness", ()
   ]);
 });
 
+void test("findBundledCodexExecutable locates npm-installed vendor binaries", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-codex-web-search-codex-bin-"));
+  const binary = join(
+    dir,
+    "node_modules",
+    "@openai",
+    "codex-linux-x64",
+    "vendor",
+    "x86_64-unknown-linux-musl",
+    "codex",
+    process.platform === "win32" ? "codex.cmd" : "codex"
+  );
+
+  await mkdir(dirname(binary), { recursive: true });
+  await writeFile(binary, process.platform === "win32" ? "@echo off\r\n" : "#!/bin/sh\n");
+  await chmod(binary, 0o755);
+
+  const found = await findBundledCodexExecutable(dir);
+  assert.equal(found, binary);
+
+  await rm(dir, { recursive: true, force: true });
+});
+
 void test("parseCodexWebSearchOutput validates and trims sources", () => {
   const parsed = parseCodexWebSearchOutput(
     JSON.stringify({
@@ -198,6 +223,34 @@ void test("parseCodexWebSearchOutput validates and trims sources", () => {
       title: "Extra",
       url: "https://example.com",
       snippet: "Kept because it is still within the source limit.",
+    },
+  ]);
+});
+
+void test("parseCodexWebSearchOutput extracts fenced JSON and tolerates missing snippets", () => {
+  const parsed = parseCodexWebSearchOutput(
+    [
+      "Here is the structured result:",
+      "```json",
+      JSON.stringify({
+        summary: "Recovered JSON body.",
+        sources: [
+          {
+            url: "https://example.com/source",
+          },
+        ],
+      }),
+      "```",
+    ].join("\n"),
+    2
+  );
+
+  assert.equal(parsed.summary, "Recovered JSON body.");
+  assert.deepEqual(parsed.sources, [
+    {
+      title: "https://example.com/source",
+      url: "https://example.com/source",
+      snippet: "",
     },
   ]);
 });
@@ -551,6 +604,31 @@ void test("executeCodexWebSearch does not hide terminal auth failures behind Def
   assert.equal(defuddleInvoked, false);
 });
 
+void test("executeCodexWebSearch classifies missing codex binaries before auth guidance", async () => {
+  const runner: RunCodexCommand = () =>
+    Promise.reject(
+      new Error(
+        "Could not find `codex` in PATH or common install locations. Install Codex CLI, then run `codex login status` or `codex login`."
+      )
+    );
+
+  await assert.rejects(
+    executeCodexWebSearch(
+      { query: "missing codex binary" },
+      {
+        cwd: process.cwd(),
+        runner,
+      }
+    ),
+    (error: unknown) => {
+      assert.ok(error instanceof Error);
+      const failure = (error as Error & { failure?: { kind?: string } }).failure;
+      assert.equal(failure?.kind, "missing_cli");
+      return true;
+    }
+  );
+});
+
 void test("executeCodexWebSearch falls back to the final stdout agent message when the output file is empty", async () => {
   const runner: RunCodexCommand = ({ args }) => {
     const outputPath = args[args.indexOf("--output-last-message") + 1];
@@ -583,6 +661,74 @@ void test("executeCodexWebSearch falls back to the final stdout agent message wh
 
   assert.match(result.content[0]?.text ?? "", /Recovered the final response from stdout\./);
   assert.equal(result.details.summary, "Recovered the final response from stdout.");
+});
+
+void test("executeCodexWebSearch understands raw response.output_item events from Codex", async () => {
+  const stdoutLines = [
+    JSON.stringify({
+      type: "response.output_item.added",
+      item: {
+        type: "web_search_call",
+        id: "ws_1",
+        status: "in_progress",
+      },
+    }),
+    JSON.stringify({
+      type: "response.output_item.done",
+      item: {
+        type: "web_search_call",
+        id: "ws_1",
+        status: "completed",
+        action: {
+          type: "search",
+          query: "raw response event query",
+        },
+      },
+    }),
+    JSON.stringify({
+      type: "response.output_item.done",
+      item: {
+        type: "message",
+        role: "assistant",
+        content: [
+          {
+            type: "output_text",
+            text: JSON.stringify({
+              summary: "Recovered from raw response events.",
+              sources: [],
+            }),
+          },
+        ],
+      },
+    }),
+  ];
+
+  const runner: RunCodexCommand = ({ args, onStdoutLine }) => {
+    const outputPath = args[args.indexOf("--output-last-message") + 1];
+    assert.ok(outputPath);
+
+    for (const line of stdoutLines) {
+      onStdoutLine?.(line);
+    }
+
+    return writeFile(outputPath, "   \n").then(() => ({
+      code: 0,
+      stdout: stdoutLines.join("\n"),
+      stderr: "",
+    }));
+  };
+
+  const result = await executeCodexWebSearch(
+    { query: "raw response event fallback" },
+    {
+      cwd: process.cwd(),
+      runner,
+    }
+  );
+
+  assert.equal(result.details.searchCount, 1);
+  assert.deepEqual(result.details.searchQueries, ["raw response event query"]);
+  assert.equal(result.details.summary, "Recovered from raw response events.");
 });
 
 void test("executeCodexWebSearch uses persisted settings for default mode and freshness", async () => {
