@@ -44,6 +44,12 @@ const SEARCH_OUTPUT_SCHEMA_PATH = fileURLToPath(
 
 const LIVE_FRESHNESS_QUERY_PATTERN =
   /\b(today|latest|current|now|weather|price|breaking|urgent)\b/iu;
+const SEARCH_OPERATOR_PATTERN =
+  /\b(?:site|filetype|intitle|inurl|after|before):\S+|["“”][^"“”]+["“”]/iu;
+const TARGETED_DOC_QUERY_PATTERN =
+  /\b(?:docs?|documentation|reference|manual|api|sdk|wiki|guide|config|settings?|flags?|options?|systemd|manpage|release notes|changelog)\b/iu;
+const URL_QUERY_PATTERN = /https?:\/\//iu;
+const MAX_RECORDED_PAGE_ACTIONS = 20;
 
 interface ResolvedWebSearchInput {
   query: string;
@@ -186,7 +192,10 @@ function hasDefuddleExtractionIntent(query: string): boolean {
   return /\b(defuddle|extract|clean|strip|markdown|summari[sz]e)\b/iu.test(query);
 }
 
-export function buildCodexPrompt(input: WebSearchInput): string {
+export function buildCodexPrompt(
+  input: WebSearchInput,
+  options: { queryBudget?: number } = {}
+): string {
   const maxSources = normalizeMaxSources(input.maxSources);
   const query = normalizeQuery(input.query);
   const mode = resolveSearchMode(input);
@@ -195,7 +204,7 @@ export function buildCodexPrompt(input: WebSearchInput): string {
     mode === "deep"
       ? [
           "This is a deeper research task.",
-          "Cross-check sources, refine queries when needed, and compare results before answering.",
+          "Cross-check sources, refine queries only when they materially change the result set, and compare results before answering.",
         ]
       : [
           "This is a quick lookup.",
@@ -207,6 +216,7 @@ export function buildCodexPrompt(input: WebSearchInput): string {
     "You are performing web research for another coding agent.",
     "Search the public web and answer the user's query using current online sources.",
     ...modeInstructions,
+    ...buildPromptStrategyHints(query, mode, options.queryBudget),
     "Return only a JSON object that matches the provided schema.",
     "Do not wrap the JSON in markdown fences or add any extra commentary.",
     `Keep the summary concise and useful for another agent. Limit the source list to at most ${maxSources} items.`,
@@ -215,6 +225,56 @@ export function buildCodexPrompt(input: WebSearchInput): string {
     "",
     `User query: ${query}`,
   ].join("\n");
+}
+
+function buildPromptStrategyHints(query: string, mode: SearchMode, queryBudget?: number): string[] {
+  const hints: string[] = [];
+
+  if (queryBudget !== undefined) {
+    hints.push(`You have a hard limit of ${queryBudget} web search queries in this run.`);
+    hints.push(
+      "Plan before searching, reuse opened pages, and avoid minor query rewrites unless they unlock meaningfully different results."
+    );
+  }
+
+  if (hasExplicitSearchConstraints(query)) {
+    hints.push(
+      "The user already supplied search operators or site constraints. Preserve them instead of broadening the search."
+    );
+    hints.push(
+      "For a constrained lookup, prefer one targeted search followed by opening the most relevant pages."
+    );
+  }
+
+  if (isLikelyDocumentationQuery(query)) {
+    hints.push(
+      "This looks like a documentation or reference lookup. Prefer official docs and page inspection over broad multi-source searching."
+    );
+  }
+
+  if (containsUrl(query)) {
+    hints.push(
+      "If the answer is likely on a referenced page, inspect that page directly before issuing more searches."
+    );
+  }
+
+  if (mode === "deep") {
+    hints.push("Stop once you have enough authoritative evidence to answer well.");
+  }
+
+  return hints;
+}
+
+function hasExplicitSearchConstraints(query: string): boolean {
+  return SEARCH_OPERATOR_PATTERN.test(query);
+}
+
+function isLikelyDocumentationQuery(query: string): boolean {
+  return TARGETED_DOC_QUERY_PATTERN.test(query);
+}
+
+function containsUrl(query: string): boolean {
+  return URL_QUERY_PATTERN.test(query);
 }
 
 export function buildCodexExecArgs(
@@ -324,6 +384,7 @@ export async function executeCodexWebSearch(
       {
         directUrlQuery: false,
         reason: exhaustedFailure.message,
+        progress: exhaustedProgress,
       }
     );
 
@@ -395,6 +456,7 @@ export async function executeCodexWebSearch(
             directUrlQuery: false,
             reason: retryFailureDetails.message,
             retry,
+            progress: retryProgress,
           }
         );
 
@@ -422,6 +484,7 @@ export async function executeCodexWebSearch(
     const defuddleFallback = await maybeRunDefuddleSearch(resolvedInput, options, settings, {
       directUrlQuery: false,
       reason: failure.message,
+      progress,
     });
 
     if (defuddleFallback) {
@@ -478,7 +541,7 @@ async function runResolvedCodexWebSearch(
     const runnerOptions: RunCodexCommandOptions = {
       args: buildCodexExecArgs({ schemaPath: SEARCH_OUTPUT_SCHEMA_PATH, outputPath }, freshness),
       cwd: options.cwd,
-      stdin: buildCodexPrompt({ query, maxSources, mode }),
+      stdin: buildCodexPrompt({ query, maxSources, mode }, { queryBudget: policy.queryBudget }),
       timeoutMs: policy.timeoutMs,
       signal,
       onStdoutLine: (line) => {
@@ -486,6 +549,9 @@ async function runResolvedCodexWebSearch(
         const updates = collectProgressUpdates(progress, line);
         for (const addedQuery of updates.queries) {
           emitProgressUpdate(options, progress, `Search #${progress.searchCount}: ${addedQuery}`);
+        }
+        for (const pageAction of updates.pageActions) {
+          emitProgressUpdate(options, progress, pageAction);
         }
         for (const status of updates.statuses) {
           emitProgressUpdate(options, progress, status);
@@ -586,6 +652,7 @@ async function runResolvedCodexWebSearch(
       freshness,
       searchCount: progress.searchCount,
       searchQueries: [...progress.searchQueries],
+      pageActions: [...progress.pageActions],
       statusEvents: [...progress.statusEvents],
       sourceCount: parsed.sources.length,
       summary: parsed.summary,
@@ -632,6 +699,7 @@ async function buildSoftFailureResult(
     freshness: input.freshness,
     searchCount: progress.searchCount,
     searchQueries: [...progress.searchQueries],
+    pageActions: [...progress.pageActions],
     statusEvents: [...progress.statusEvents],
     sourceCount: 0,
     summary,
@@ -719,6 +787,7 @@ async function maybeRunDefuddleSearch(
     reason: string;
     urls?: string[];
     retry?: RetryProvenance;
+    progress?: WebSearchProgressDetails;
   }
 ): Promise<
   | {
@@ -737,7 +806,9 @@ async function maybeRunDefuddleSearch(
     return undefined;
   }
 
-  const progress = createSearchProgress(input.query, input.mode, input.freshness);
+  const progress = defuddle.progress
+    ? cloneProgress(defuddle.progress)
+    : createSearchProgress(input.query, input.mode, input.freshness);
   const results: DefuddleParseResult[] = [];
 
   for (const url of urls) {
@@ -780,8 +851,9 @@ async function maybeRunDefuddleSearch(
     query: input.query,
     mode: input.mode,
     freshness: input.freshness,
-    searchCount: 0,
-    searchQueries: [],
+    searchCount: progress.searchCount,
+    searchQueries: [...progress.searchQueries],
+    pageActions: [...progress.pageActions],
     statusEvents: [...progress.statusEvents],
     sourceCount: sources.length,
     summary,
@@ -793,6 +865,10 @@ async function maybeRunDefuddleSearch(
       urls: results.map((result) => result.url),
     },
   };
+
+  if (progress.latestQuery) {
+    details.latestQuery = progress.latestQuery;
+  }
 
   if (defuddle.retry) {
     details.retry = defuddle.retry;
@@ -1177,6 +1253,7 @@ function createSearchProgress(
     freshness,
     searchCount: 0,
     searchQueries: [],
+    pageActions: [],
     statusEvents: [],
   };
 }
@@ -1188,6 +1265,7 @@ function cloneProgress(progress: WebSearchProgressDetails): WebSearchProgressDet
     freshness: progress.freshness,
     searchCount: progress.searchCount,
     searchQueries: [...progress.searchQueries],
+    pageActions: [...progress.pageActions],
     statusEvents: [...progress.statusEvents],
     ...(progress.latestQuery ? { latestQuery: progress.latestQuery } : {}),
     ...(progress.statusText ? { statusText: progress.statusText } : {}),
@@ -1231,15 +1309,16 @@ function mergeAbortSignals(
 function collectProgressUpdates(
   progress: WebSearchProgressDetails,
   line: string
-): { queries: string[]; statuses: string[] } {
+): { queries: string[]; pageActions: string[]; statuses: string[] } {
   const event = parseJsonObject(line);
   if (!event) {
-    return { queries: [], statuses: [] };
+    return { queries: [], pageActions: [], statuses: [] };
   }
 
   const queries = collectSearchQueries(progress, event);
+  const pageActions = collectPageActions(progress, event);
   const statuses = collectStatusEvents(progress, event);
-  return { queries, statuses };
+  return { queries, pageActions, statuses };
 }
 
 function collectSearchQueries(
@@ -1266,6 +1345,32 @@ function collectSearchQueries(
   }
 
   return addedQueries;
+}
+
+function collectPageActions(
+  progress: WebSearchProgressDetails,
+  event: Record<string, unknown>
+): string[] {
+  const pageActions = extractPageActions(event);
+  if (pageActions.length === 0) {
+    return [];
+  }
+
+  const addedPageActions: string[] = [];
+  for (const pageAction of pageActions) {
+    const normalized = pageAction.trim();
+    if (!normalized || progress.pageActions.includes(normalized)) {
+      continue;
+    }
+
+    progress.pageActions.push(normalized);
+    if (progress.pageActions.length > MAX_RECORDED_PAGE_ACTIONS) {
+      progress.pageActions.splice(0, progress.pageActions.length - MAX_RECORDED_PAGE_ACTIONS);
+    }
+    addedPageActions.push(normalized);
+  }
+
+  return addedPageActions;
 }
 
 function collectStatusEvents(
@@ -1449,13 +1554,47 @@ function extractSearchQueries(event: Record<string, unknown>): string[] {
   }
 
   const queries = [
-    ...extractQueryValues(typedItem.queries),
-    ...extractQueryValues(typedItem.query),
+    ...(shouldTreatTopLevelQueriesAsSearch(typedItem)
+      ? [...extractQueryValues(typedItem.queries), ...extractQueryValues(typedItem.query)]
+      : []),
     ...extractSearchActionQueries(typedItem.action),
     ...extractSearchActionQueries(typedItem.output),
   ];
 
-  return dedupeQueries(queries);
+  return dedupeStrings(queries);
+}
+
+function extractPageActions(event: Record<string, unknown>): string[] {
+  const item = extractEventItem(event);
+  if (!item) {
+    return [];
+  }
+
+  const typedItem = item as {
+    type?: unknown;
+    action?: unknown;
+    output?: unknown;
+  };
+
+  if (typedItem.type !== "web_search" && typedItem.type !== "web_search_call") {
+    return [];
+  }
+
+  return dedupeStrings([
+    ...extractPageActionTexts(typedItem.action),
+    ...extractPageActionTexts(typedItem.output),
+  ]);
+}
+
+function shouldTreatTopLevelQueriesAsSearch(value: {
+  action?: unknown;
+  output?: unknown;
+}): boolean {
+  const actionTypes = [extractActionType(value.action), extractActionType(value.output)].filter(
+    (actionType): actionType is string => typeof actionType === "string"
+  );
+
+  return actionTypes.length === 0 || actionTypes.includes("search");
 }
 
 function extractSearchActionQueries(value: unknown): string[] {
@@ -1467,28 +1606,53 @@ function extractSearchActionQueries(value: unknown): string[] {
     type?: unknown;
     query?: unknown;
     queries?: unknown;
-    url?: unknown;
-    pattern?: unknown;
   };
 
   if (typedValue.type === undefined || typedValue.type === "search") {
     return [...extractQueryValues(typedValue.queries), ...extractQueryValues(typedValue.query)];
   }
 
+  return [];
+}
+
+function extractPageActionTexts(value: unknown): string[] {
+  if (!value || typeof value !== "object") {
+    return [];
+  }
+
+  const typedValue = value as {
+    type?: unknown;
+    url?: unknown;
+    pattern?: unknown;
+  };
+
   if (typedValue.type === "open_page") {
-    return extractQueryValues(typedValue.url);
+    return extractQueryValues(typedValue.url).map((url) => `Open page: ${url}`);
   }
 
   if (typedValue.type === "find_in_page") {
     const url = extractQueryValues(typedValue.url)[0];
     const pattern = extractQueryValues(typedValue.pattern)[0];
     if (url && pattern) {
-      return [`${pattern} in ${url}`];
+      return [`Find in page: ${pattern} in ${url}`];
     }
-    return [url, pattern].filter((query): query is string => !!query);
+
+    return [
+      url ? `Open page: ${url}` : undefined,
+      pattern ? `Find in page: ${pattern}` : undefined,
+    ].filter((action): action is string => !!action);
   }
 
   return [];
+}
+
+function extractActionType(value: unknown): string | undefined {
+  if (!value || typeof value !== "object") {
+    return undefined;
+  }
+
+  const typedValue = value as { type?: unknown };
+  return typeof typedValue.type === "string" ? typedValue.type : undefined;
 }
 
 function extractQueryValues(value: unknown): string[] {
@@ -1503,18 +1667,18 @@ function extractQueryValues(value: unknown): string[] {
   return value.filter((query): query is string => typeof query === "string");
 }
 
-function dedupeQueries(queries: string[]): string[] {
-  const uniqueQueries: string[] = [];
+function dedupeStrings(values: string[]): string[] {
+  const uniqueValues: string[] = [];
 
-  for (const query of queries) {
-    const normalized = query.trim();
-    if (!normalized || uniqueQueries.includes(normalized)) {
+  for (const value of values) {
+    const normalized = value.trim();
+    if (!normalized || uniqueValues.includes(normalized)) {
       continue;
     }
-    uniqueQueries.push(normalized);
+    uniqueValues.push(normalized);
   }
 
-  return uniqueQueries;
+  return uniqueValues;
 }
 
 function isCodexWebSearchOutput(value: unknown): value is LooseCodexWebSearchOutput {

@@ -118,17 +118,23 @@ void test("resolveSearchFreshness honors explicit overrides and auto-live hints"
 
 void test("buildCodexPrompt produces a JSON-only research prompt", () => {
   const fastPrompt = buildCodexPrompt({ query: "latest codex cli release", maxSources: 3 });
-  const deepPrompt = buildCodexPrompt({
-    query: "latest codex cli release",
-    maxSources: 3,
-    mode: "deep",
-  });
+  const deepPrompt = buildCodexPrompt(
+    {
+      query: "site:wiki.archlinux.org Niri xdg-desktop-portal wayland session",
+      maxSources: 3,
+      mode: "deep",
+    },
+    { queryBudget: 24 }
+  );
 
   assert.match(fastPrompt, /Return only a JSON object/i);
   assert.match(fastPrompt, /at most 3 items/i);
   assert.match(fastPrompt, /User query: latest codex cli release/);
   assert.match(fastPrompt, /quick lookup/i);
   assert.match(deepPrompt, /deeper research task/i);
+  assert.match(deepPrompt, /hard limit of 24 web search queries/i);
+  assert.match(deepPrompt, /supplied search operators or site constraints/i);
+  assert.match(deepPrompt, /documentation or reference lookup/i);
 });
 
 void test("buildCodexExecArgs configures the requested web-search freshness", () => {
@@ -519,6 +525,82 @@ void test("executeCodexWebSearch falls back to Defuddle for URL-based requests w
   assert.equal(result.details.defuddle?.reason, "Codex web search timed out after 90 seconds.");
   assert.match(result.details.summary, /Codex did not produce a usable response/);
   assert.equal(result.details.sources[0]?.url, "https://developers.openai.com/codex/cli/features");
+});
+
+void test("executeCodexWebSearch preserves Codex progress when Defuddle handles a failed run", async () => {
+  const runner: RunCodexCommand = ({ onStdoutLine }) => {
+    onStdoutLine?.(
+      JSON.stringify({
+        type: "item.completed",
+        item: {
+          type: "web_search",
+          action: {
+            type: "search",
+            query: "site:developers.openai.com codex cli features",
+          },
+        },
+      })
+    );
+    onStdoutLine?.(
+      JSON.stringify({
+        type: "item.completed",
+        item: {
+          type: "web_search",
+          action: {
+            type: "open_page",
+            url: "https://developers.openai.com/codex/cli/features",
+          },
+        },
+      })
+    );
+    onStdoutLine?.(
+      JSON.stringify({
+        type: "error",
+        message: "Reconnecting... 1/2",
+      })
+    );
+
+    return Promise.reject(new Error("Codex web search timed out after 90 seconds."));
+  };
+
+  const defuddleRunner: RunDefuddleCommand = ({ url }) => {
+    assert.equal(url, "https://developers.openai.com/codex/cli/features");
+    return Promise.resolve({
+      url,
+      title: "Features – Codex CLI | OpenAI Developers",
+      description: "Overview of functionality in the Codex terminal client",
+      domain: "developers.openai.com",
+      author: "",
+      published: "",
+      wordCount: 1234,
+      content: "Codex supports workflows beyond chat.",
+    });
+  };
+
+  const result = await executeCodexWebSearch(
+    { query: "summarize https://developers.openai.com/codex/cli/features", mode: "deep" },
+    {
+      cwd: process.cwd(),
+      runner,
+      defuddleRunner,
+      settings: {
+        ...DEFAULT_WEB_SEARCH_SETTINGS,
+        defuddleMode: "both",
+      },
+    }
+  );
+
+  assert.equal(result.details.mode, "deep");
+  assert.equal(result.details.freshness, "live");
+  assert.equal(result.details.searchCount, 1);
+  assert.equal(result.details.latestQuery, "site:developers.openai.com codex cli features");
+  assert.deepEqual(result.details.searchQueries, ["site:developers.openai.com codex cli features"]);
+  assert.deepEqual(result.details.pageActions, [
+    "Open page: https://developers.openai.com/codex/cli/features",
+  ]);
+  assert.deepEqual(result.details.statusEvents, ["Reconnecting... 1/2"]);
+  assert.equal(result.details.defuddle?.reason, "Codex web search timed out after 90 seconds.");
+  assert.equal(result.details.retry, undefined);
 });
 
 void test("executeCodexWebSearch does not use Defuddle fallback for generic URL queries", async () => {
@@ -1077,6 +1159,109 @@ void test("executeCodexWebSearch allows runs that use the full fast search budge
 
   assert.equal(result.details.searchCount, 10);
   assert.match(result.content[0]?.text ?? "", /Completed at the fast search budget\./);
+});
+
+void test("executeCodexWebSearch does not count page inspection against the search budget", async () => {
+  const runner: RunCodexCommand = ({ args, onStdoutLine, signal }) => {
+    for (let i = 1; i <= 10; i += 1) {
+      onStdoutLine?.(
+        JSON.stringify({
+          type: "item.completed",
+          item: {
+            type: "web_search",
+            action: {
+              type: "search",
+              query: `query ${i}`,
+              queries: [`query ${i}`],
+            },
+          },
+        })
+      );
+      if (signal?.aborted) {
+        break;
+      }
+    }
+
+    onStdoutLine?.(
+      JSON.stringify({
+        type: "item.completed",
+        item: {
+          type: "web_search",
+          action: {
+            type: "open_page",
+            url: "https://wiki.archlinux.org/title/Niri",
+          },
+        },
+      })
+    );
+    if (signal?.aborted) {
+      const reason: unknown = signal.reason;
+      return Promise.reject(
+        reason instanceof Error
+          ? reason
+          : new Error(typeof reason === "string" ? reason : "expected abort")
+      );
+    }
+
+    onStdoutLine?.(
+      JSON.stringify({
+        type: "item.completed",
+        item: {
+          type: "web_search",
+          action: {
+            type: "find_in_page",
+            url: "https://wiki.archlinux.org/title/Niri",
+            pattern: "xdg-desktop-portal",
+          },
+        },
+      })
+    );
+    if (signal?.aborted) {
+      const reason: unknown = signal.reason;
+      return Promise.reject(
+        reason instanceof Error
+          ? reason
+          : new Error(typeof reason === "string" ? reason : "expected abort")
+      );
+    }
+
+    const outputPath = args[args.indexOf("--output-last-message") + 1];
+    assert.ok(outputPath);
+    return writeFile(
+      outputPath,
+      JSON.stringify({
+        summary: "Page inspection stayed within the search budget.",
+        sources: [],
+      })
+    ).then(() => ({ code: 0, stdout: "", stderr: "" }));
+  };
+
+  const result = await executeCodexWebSearch(
+    { query: "site:wiki.archlinux.org Niri xdg-desktop-portal", mode: "fast" },
+    {
+      cwd: process.cwd(),
+      runner,
+    }
+  );
+
+  assert.equal(result.details.searchCount, 10);
+  assert.deepEqual(result.details.searchQueries, [
+    "query 1",
+    "query 2",
+    "query 3",
+    "query 4",
+    "query 5",
+    "query 6",
+    "query 7",
+    "query 8",
+    "query 9",
+    "query 10",
+  ]);
+  assert.deepEqual(result.details.pageActions, [
+    "Open page: https://wiki.archlinux.org/title/Niri",
+    "Find in page: xdg-desktop-portal in https://wiki.archlinux.org/title/Niri",
+  ]);
+  assert.match(result.content[0]?.text ?? "", /Page inspection stayed within the search budget\./);
 });
 
 void test("executeCodexWebSearch counts repeated identical searches against the fast budget", async () => {
