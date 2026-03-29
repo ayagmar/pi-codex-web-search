@@ -1303,6 +1303,91 @@ void test("executeCodexWebSearch ignores find_in_page actions without a pattern"
   assert.match(result.content[0]?.text ?? "", /Ignored incomplete find_in_page action\./);
 });
 
+void test("executeCodexWebSearch keeps non-consecutive repeated page actions", async () => {
+  const runner: RunCodexCommand = ({ args, onStdoutLine }) => {
+    const url = "https://wiki.archlinux.org/title/Niri";
+
+    onStdoutLine?.(
+      JSON.stringify({
+        type: "item.completed",
+        item: {
+          type: "web_search",
+          action: {
+            type: "open_page",
+            url,
+          },
+        },
+      })
+    );
+    onStdoutLine?.(
+      JSON.stringify({
+        type: "item.completed",
+        item: {
+          type: "web_search",
+          action: {
+            type: "open_page",
+            url,
+          },
+        },
+      })
+    );
+    onStdoutLine?.(
+      JSON.stringify({
+        type: "item.completed",
+        item: {
+          type: "web_search",
+          action: {
+            type: "find_in_page",
+            url,
+            pattern: "xdg-desktop-portal",
+          },
+        },
+      })
+    );
+    onStdoutLine?.(
+      JSON.stringify({
+        type: "item.completed",
+        item: {
+          type: "web_search",
+          action: {
+            type: "open_page",
+            url,
+          },
+        },
+      })
+    );
+
+    const outputPath = args[args.indexOf("--output-last-message") + 1];
+    assert.ok(outputPath);
+    return writeFile(
+      outputPath,
+      JSON.stringify({
+        summary: "Repeated page actions were preserved when separated by other activity.",
+        sources: [],
+      })
+    ).then(() => ({ code: 0, stdout: "", stderr: "" }));
+  };
+
+  const result = await executeCodexWebSearch(
+    { query: "site:wiki.archlinux.org Niri", mode: "fast" },
+    {
+      cwd: process.cwd(),
+      runner,
+    }
+  );
+
+  assert.equal(result.details.searchCount, 0);
+  assert.deepEqual(result.details.pageActions, [
+    "Open page: https://wiki.archlinux.org/title/Niri",
+    "Find in page: xdg-desktop-portal in https://wiki.archlinux.org/title/Niri",
+    "Open page: https://wiki.archlinux.org/title/Niri",
+  ]);
+  assert.match(
+    result.content[0]?.text ?? "",
+    /Repeated page actions were preserved when separated by other activity\./
+  );
+});
+
 void test("executeCodexWebSearch counts repeated identical searches against the fast budget", async () => {
   const runner: RunCodexCommand = ({ onStdoutLine, signal }) => {
     for (let i = 1; i <= 11; i += 1) {

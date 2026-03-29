@@ -48,7 +48,6 @@ const SEARCH_OPERATOR_PATTERN =
   /\b(?:site|filetype|intitle|inurl|after|before):\S+|["“”][^"“”]+["“”]/iu;
 const TARGETED_DOC_QUERY_PATTERN =
   /\b(?:docs?|documentation|reference|manual|api|sdk|wiki|guide|config|settings?|flags?|options?|systemd|manpage|release notes|changelog)\b/iu;
-const URL_QUERY_PATTERN = /https?:\/\//iu;
 const MAX_RECORDED_PAGE_ACTIONS = 20;
 
 interface ResolvedWebSearchInput {
@@ -252,7 +251,7 @@ function buildPromptStrategyHints(query: string, mode: SearchMode, queryBudget?:
     );
   }
 
-  if (containsUrl(query)) {
+  if (extractUrlsFromText(query).length > 0) {
     hints.push(
       "If the answer is likely on a referenced page, inspect that page directly before issuing more searches."
     );
@@ -271,10 +270,6 @@ function hasExplicitSearchConstraints(query: string): boolean {
 
 function isLikelyDocumentationQuery(query: string): boolean {
   return TARGETED_DOC_QUERY_PATTERN.test(query);
-}
-
-function containsUrl(query: string): boolean {
-  return URL_QUERY_PATTERN.test(query);
 }
 
 export function buildCodexExecArgs(
@@ -1360,7 +1355,8 @@ function collectPageActions(
   const addedPageActions: string[] = [];
   for (const pageAction of pageActions) {
     const normalized = pageAction.trim();
-    if (!normalized || recordedPageActions.includes(normalized)) {
+    const lastRecordedPageAction = recordedPageActions[recordedPageActions.length - 1];
+    if (!normalized || normalized === lastRecordedPageAction) {
       continue;
     }
 
