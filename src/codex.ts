@@ -652,7 +652,7 @@ async function runResolvedCodexWebSearch(
       freshness,
       searchCount: progress.searchCount,
       searchQueries: [...progress.searchQueries],
-      pageActions: [...progress.pageActions],
+      pageActions: [...(progress.pageActions ?? [])],
       statusEvents: [...progress.statusEvents],
       sourceCount: parsed.sources.length,
       summary: parsed.summary,
@@ -699,7 +699,7 @@ async function buildSoftFailureResult(
     freshness: input.freshness,
     searchCount: progress.searchCount,
     searchQueries: [...progress.searchQueries],
-    pageActions: [...progress.pageActions],
+    pageActions: [...(progress.pageActions ?? [])],
     statusEvents: [...progress.statusEvents],
     sourceCount: 0,
     summary,
@@ -853,7 +853,7 @@ async function maybeRunDefuddleSearch(
     freshness: input.freshness,
     searchCount: progress.searchCount,
     searchQueries: [...progress.searchQueries],
-    pageActions: [...progress.pageActions],
+    pageActions: [...(progress.pageActions ?? [])],
     statusEvents: [...progress.statusEvents],
     sourceCount: sources.length,
     summary,
@@ -1265,7 +1265,7 @@ function cloneProgress(progress: WebSearchProgressDetails): WebSearchProgressDet
     freshness: progress.freshness,
     searchCount: progress.searchCount,
     searchQueries: [...progress.searchQueries],
-    pageActions: [...progress.pageActions],
+    pageActions: [...(progress.pageActions ?? [])],
     statusEvents: [...progress.statusEvents],
     ...(progress.latestQuery ? { latestQuery: progress.latestQuery } : {}),
     ...(progress.statusText ? { statusText: progress.statusText } : {}),
@@ -1356,16 +1356,17 @@ function collectPageActions(
     return [];
   }
 
+  const recordedPageActions = progress.pageActions ?? (progress.pageActions = []);
   const addedPageActions: string[] = [];
   for (const pageAction of pageActions) {
     const normalized = pageAction.trim();
-    if (!normalized || progress.pageActions.includes(normalized)) {
+    if (!normalized || recordedPageActions.includes(normalized)) {
       continue;
     }
 
-    progress.pageActions.push(normalized);
-    if (progress.pageActions.length > MAX_RECORDED_PAGE_ACTIONS) {
-      progress.pageActions.splice(0, progress.pageActions.length - MAX_RECORDED_PAGE_ACTIONS);
+    recordedPageActions.push(normalized);
+    if (recordedPageActions.length > MAX_RECORDED_PAGE_ACTIONS) {
+      recordedPageActions.splice(0, recordedPageActions.length - MAX_RECORDED_PAGE_ACTIONS);
     }
     addedPageActions.push(normalized);
   }
@@ -1637,10 +1638,9 @@ function extractPageActionTexts(value: unknown): string[] {
       return [`Find in page: ${pattern} in ${url}`];
     }
 
-    return [
-      url ? `Open page: ${url}` : undefined,
-      pattern ? `Find in page: ${pattern}` : undefined,
-    ].filter((action): action is string => !!action);
+    return [pattern ? `Find in page: ${pattern}` : undefined].filter(
+      (action): action is string => !!action
+    );
   }
 
   return [];

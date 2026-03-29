@@ -1264,6 +1264,45 @@ void test("executeCodexWebSearch does not count page inspection against the sear
   assert.match(result.content[0]?.text ?? "", /Page inspection stayed within the search budget\./);
 });
 
+void test("executeCodexWebSearch ignores find_in_page actions without a pattern", async () => {
+  const runner: RunCodexCommand = ({ args, onStdoutLine }) => {
+    onStdoutLine?.(
+      JSON.stringify({
+        type: "item.completed",
+        item: {
+          type: "web_search",
+          action: {
+            type: "find_in_page",
+            url: "https://wiki.archlinux.org/title/Niri",
+          },
+        },
+      })
+    );
+
+    const outputPath = args[args.indexOf("--output-last-message") + 1];
+    assert.ok(outputPath);
+    return writeFile(
+      outputPath,
+      JSON.stringify({
+        summary: "Ignored incomplete find_in_page action.",
+        sources: [],
+      })
+    ).then(() => ({ code: 0, stdout: "", stderr: "" }));
+  };
+
+  const result = await executeCodexWebSearch(
+    { query: "site:wiki.archlinux.org Niri", mode: "fast" },
+    {
+      cwd: process.cwd(),
+      runner,
+    }
+  );
+
+  assert.equal(result.details.searchCount, 0);
+  assert.deepEqual(result.details.pageActions, []);
+  assert.match(result.content[0]?.text ?? "", /Ignored incomplete find_in_page action\./);
+});
+
 void test("executeCodexWebSearch counts repeated identical searches against the fast budget", async () => {
   const runner: RunCodexCommand = ({ onStdoutLine, signal }) => {
     for (let i = 1; i <= 11; i += 1) {
