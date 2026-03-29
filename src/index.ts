@@ -138,6 +138,7 @@ export default function codexWebSearchExtension(pi: ExtensionAPI) {
         return new Text(statusLine, 0, 0);
       }
 
+      const pageActions = Array.isArray(details.pageActions) ? details.pageActions : [];
       const failed = !!details.failure;
       let text = theme.fg(
         failed ? "warning" : "success",
@@ -168,6 +169,8 @@ export default function codexWebSearchExtension(pi: ExtensionAPI) {
           text += `\n${theme.fg("dim", formatInlineQuery(details.failure.message, 110))}`;
         } else if (details.latestQuery) {
           text += `\n${theme.fg("dim", `Last query: ${formatInlineQuery(details.latestQuery, 110)}`)}`;
+        } else if (pageActions.length > 0) {
+          text += `\n${theme.fg("dim", formatInlineQuery(pageActions[pageActions.length - 1], 110))}`;
         }
         if (details.defuddle?.urls[0]) {
           text += `\n${theme.fg("dim", `Page: ${formatInlineQuery(details.defuddle.urls[0], 110)}`)}`;
@@ -198,6 +201,12 @@ export default function codexWebSearchExtension(pi: ExtensionAPI) {
         text += `\n${theme.fg("muted", `Queries (${details.searchQueries.length}):`)}`;
         for (const [index, query] of details.searchQueries.entries()) {
           text += `\n${theme.fg("dim", `  ${index + 1}. ${query}`)}`;
+        }
+      }
+      if (pageActions.length > 0) {
+        text += `\n${theme.fg("muted", `Page actions (${pageActions.length}):`)}`;
+        for (const [index, pageAction] of pageActions.entries()) {
+          text += `\n${theme.fg("dim", `  ${index + 1}. ${pageAction}`)}`;
         }
       }
 
@@ -685,6 +694,7 @@ function hasRenderableResultDetails(
     typeof details.sourceCount === "number" &&
     typeof details.searchCount === "number" &&
     Array.isArray(details.searchQueries) &&
+    (details.pageActions === undefined || Array.isArray(details.pageActions)) &&
     Array.isArray(details.statusEvents) &&
     Array.isArray(details.sources) &&
     typeof details.summary === "string" &&
@@ -704,6 +714,7 @@ function renderProgress(
   const freshness = details?.freshness ?? "cached";
   const statusText = details?.statusText ?? "Searching the web";
   const statusEvents = details?.statusEvents ?? [];
+  const pageActions = details?.pageActions ?? [];
 
   let text = theme.fg("warning", statusText);
   text += theme.fg(
@@ -717,6 +728,8 @@ function renderProgress(
       text += `\n${theme.fg("dim", formatInlineQuery(statusEvents[statusEvents.length - 1], 110))}`;
     } else if (details?.latestQuery) {
       text += `\n${theme.fg("dim", `Latest: ${formatInlineQuery(details.latestQuery, 110)}`)}`;
+    } else if (pageActions.length > 0) {
+      text += `\n${theme.fg("dim", formatInlineQuery(pageActions[pageActions.length - 1], 110))}`;
     }
     return text;
   }
@@ -728,17 +741,27 @@ function renderProgress(
     }
   }
 
-  if (!details || details.searchQueries.length === 0) {
-    if (statusEvents.length === 0) {
-      text += `\n${theme.fg("dim", "Waiting for Codex to emit search queries...")}`;
+  if (details?.searchQueries.length) {
+    text += `\n${theme.fg("muted", `Queries (${details.searchQueries.length}):`)}`;
+    for (const [index, query] of details.searchQueries.entries()) {
+      text += `\n${theme.fg("dim", `  ${index + 1}. ${query}`)}`;
     }
-    return text;
   }
 
-  text += `\n${theme.fg("muted", `Queries (${details.searchQueries.length}):`)}`;
-  for (const [index, query] of details.searchQueries.entries()) {
-    text += `\n${theme.fg("dim", `  ${index + 1}. ${query}`)}`;
+  if (pageActions.length > 0) {
+    text += `\n${theme.fg("muted", `Page actions (${pageActions.length}):`)}`;
+    for (const [index, pageAction] of pageActions.entries()) {
+      text += `\n${theme.fg("dim", `  ${index + 1}. ${pageAction}`)}`;
+    }
   }
+
+  if (
+    !details ||
+    (details.searchQueries.length === 0 && pageActions.length === 0 && statusEvents.length === 0)
+  ) {
+    text += `\n${theme.fg("dim", "Waiting for Codex to emit search activity...")}`;
+  }
+
   return text;
 }
 

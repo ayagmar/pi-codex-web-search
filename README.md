@@ -27,6 +27,7 @@ The extension then:
 
 - parses Codex JSONL events to show search progress in Pi
 - tracks the actual search queries Codex issued across multiple item event shapes
+- keeps page opens/find-in-page activity separate so document inspection does not incorrectly consume the query budget
 - keeps a running search counter in the tool UI
 - shows clearer in-flight status when fast mode nears its budget or auto-escalates
 - uses persisted defaults for mode, freshness, and per-mode source caps unless the tool call overrides them
@@ -103,12 +104,14 @@ Behavior:
 - keeps `cached` as the default for normal fast lookups and only auto-promotes to `live` for strong recency cues like `today`, `latest`, `current`, `now`, `weather`, `price`, `breaking`, and `urgent`
 - uses Defuddle immediately when the query is just a URL (including `https://defuddle.md/<url>` mirrors) when `defuddle-mode` allows direct extraction
 - automatically retries one recoverable default fast search as `deep` + `live` when Codex times out, burns through the fast query budget, loses transport, or fails to emit a usable final response
+- strengthens the Codex prompt with hard budget awareness plus targeted guidance for site-constrained and documentation-style queries
 - shows reconnects, WebSocket-to-HTTPS fallback, and the final classified failure cause in tool progress/details when they happen
 - can fall back to Defuddle for single-URL extraction-style requests when Codex still fails after its own retries, if `defuddle-mode` enables fallback
 - falls back to Codex's final JSONL agent message if `--output-last-message` comes back empty, including newer raw `response.output_item.*` assistant events as a compatibility path
 - tolerates fenced or wrapped JSON when Codex produces the right object with extra surrounding text
 - treats `turn.failed`, `response.*.failed`, and `error` JSONL events as first-class failure signals
 - enforces smaller time/query budgets in fast mode so lightweight lookups do not run indefinitely
+- counts only real web searches against those budgets, not `open_page` or `find_in_page` follow-up actions
 - warns when fast mode has consumed its full query budget and is about to fail or auto-escalate
 - blocks repeated fast-mode retries within the same turn after fast mode has already been exhausted
 - shows live search queries and a running search counter in Pi's tool UI

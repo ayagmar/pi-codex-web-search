@@ -46,6 +46,7 @@ export interface WebSearchProgressDetails {
   freshness: SearchFreshness;
   searchCount: number;
   searchQueries: string[];
+  pageActions: string[];
   latestQuery?: string;
   statusText?: string;
   statusEvents: string[];
