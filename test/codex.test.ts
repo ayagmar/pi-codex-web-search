@@ -117,6 +117,11 @@ void test("resolveSearchFreshness honors explicit overrides and auto-live hints"
 });
 
 void test("buildCodexPrompt produces a JSON-only research prompt", () => {
+  const defaultFastPrompt = buildCodexPrompt({ query: "latest codex cli release" });
+  const defaultDeepPrompt = buildCodexPrompt({
+    query: "site:wiki.archlinux.org Niri xdg-desktop-portal wayland session",
+    mode: "deep",
+  });
   const fastPrompt = buildCodexPrompt({ query: "latest codex cli release", maxSources: 3 });
   const deepPrompt = buildCodexPrompt(
     {
@@ -131,6 +136,14 @@ void test("buildCodexPrompt produces a JSON-only research prompt", () => {
   assert.match(fastPrompt, /at most 3 items/i);
   assert.match(fastPrompt, /User query: latest codex cli release/);
   assert.match(fastPrompt, /quick lookup/i);
+  assert.match(
+    defaultFastPrompt,
+    new RegExp(`at most ${DEFAULT_WEB_SEARCH_SETTINGS.fastMaxSources} items`, "i")
+  );
+  assert.match(
+    defaultDeepPrompt,
+    new RegExp(`at most ${DEFAULT_WEB_SEARCH_SETTINGS.deepMaxSources} items`, "i")
+  );
   assert.match(deepPrompt, /deeper research task/i);
   assert.match(deepPrompt, /hard limit of 24 web search queries/i);
   assert.match(deepPrompt, /supplied search operators or site constraints/i);
