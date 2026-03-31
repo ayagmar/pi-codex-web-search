@@ -195,9 +195,12 @@ export function buildCodexPrompt(
   input: WebSearchInput,
   options: { queryBudget?: number } = {}
 ): string {
-  const maxSources = normalizeMaxSources(input.maxSources);
-  const query = normalizeQuery(input.query);
   const mode = resolveSearchMode(input);
+  const maxSources = normalizeMaxSources(
+    input.maxSources,
+    resolveDefaultMaxSources(mode, DEFAULT_WEB_SEARCH_SETTINGS)
+  );
+  const query = normalizeQuery(input.query);
 
   const modeInstructions =
     mode === "deep"
