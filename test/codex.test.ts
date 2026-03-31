@@ -1401,6 +1401,79 @@ void test("executeCodexWebSearch keeps non-consecutive repeated page actions", a
   );
 });
 
+void test("executeCodexWebSearch deduplicates page actions around search events", async () => {
+  const runner: RunCodexCommand = ({ args, onStdoutLine }) => {
+    const url = "https://wiki.archlinux.org/title/Niri";
+
+    onStdoutLine?.(
+      JSON.stringify({
+        type: "item.completed",
+        item: {
+          type: "web_search",
+          action: {
+            type: "open_page",
+            url,
+          },
+        },
+      })
+    );
+    onStdoutLine?.(
+      JSON.stringify({
+        type: "item.completed",
+        item: {
+          type: "web_search",
+          action: {
+            type: "search",
+            query: "Niri wayland compositor features",
+            queries: ["Niri wayland compositor features"],
+          },
+        },
+      })
+    );
+    onStdoutLine?.(
+      JSON.stringify({
+        type: "item.completed",
+        item: {
+          type: "web_search",
+          action: {
+            type: "open_page",
+            url,
+          },
+        },
+      })
+    );
+
+    const outputPath = args[args.indexOf("--output-last-message") + 1];
+    assert.ok(outputPath);
+    return writeFile(
+      outputPath,
+      JSON.stringify({
+        summary: "Page actions around search were deduplicated correctly.",
+        sources: [],
+      })
+    ).then(() => ({ code: 0, stdout: "", stderr: "" }));
+  };
+
+  const result = await executeCodexWebSearch(
+    { query: "site:wiki.archlinux.org Niri", mode: "fast" },
+    {
+      cwd: process.cwd(),
+      runner,
+    }
+  );
+
+  assert.equal(result.details.searchCount, 1);
+  // Duplicate page actions are deduplicated even across search events
+  // since search events don't add page actions to the list
+  assert.deepEqual(result.details.pageActions, [
+    "Open page: https://wiki.archlinux.org/title/Niri",
+  ]);
+  assert.match(
+    result.content[0]?.text ?? "",
+    /Page actions around search were deduplicated correctly\./
+  );
+});
+
 void test("executeCodexWebSearch counts repeated identical searches against the fast budget", async () => {
   const runner: RunCodexCommand = ({ onStdoutLine, signal }) => {
     for (let i = 1; i <= 11; i += 1) {
