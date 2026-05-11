@@ -1,11 +1,11 @@
-import { StringEnum } from "@mariozechner/pi-ai";
+import { StringEnum } from "@earendil-works/pi-ai";
 import {
   keyHint,
   type ExtensionAPI,
   type ExtensionCommandContext,
-} from "@mariozechner/pi-coding-agent";
-import { Text } from "@mariozechner/pi-tui";
-import { Type } from "@sinclair/typebox";
+} from "@earendil-works/pi-coding-agent";
+import { Text } from "@earendil-works/pi-tui";
+import { Type } from "typebox";
 import { executeCodexWebSearch } from "./codex.js";
 import {
   MAX_ALLOWED_SOURCES,

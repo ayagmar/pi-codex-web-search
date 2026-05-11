@@ -1,4 +1,4 @@
-import type { AgentToolUpdateCallback } from "@mariozechner/pi-coding-agent";
+import type { AgentToolUpdateCallback } from "@earendil-works/pi-coding-agent";
 
 export type SearchMode = "fast" | "deep";
 export type SearchFreshness = "cached" | "live";
