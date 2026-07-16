@@ -13,15 +13,16 @@ It is designed for the case where:
 When Pi calls `web_search`, the extension auto-resolves a usable Codex binary, then runs Codex non-interactively:
 
 - `codex exec --json`
-- `-c web_search="cached"` or `-c web_search="live"`
+- `-c web_search="indexed"`, `-c web_search="cached"`, or `-c web_search="live"`
 - read-only sandbox
 - ephemeral session
 - structured JSON output enforced with `--output-schema`
 - final assistant message captured with `--output-last-message`
 
-Codex's official web-search modes are `disabled | cached | live`.
-This extension uses `cached` and `live` explicitly per tool call. In Codex CLI terms,
-`--search` is equivalent to live web search.
+Codex's current web-search modes are `disabled | cached | indexed | live`.
+This extension uses `indexed` for the normal fast path, `cached` when explicitly requested,
+and `live` for freshness-sensitive searches. `indexed` is Codex's hosted index path: it is
+usually more useful than a stale cache without paying the latency of a live crawl.
 
 The extension then:
 
@@ -32,6 +33,8 @@ The extension then:
 - shows clearer in-flight status when fast mode nears its budget or auto-escalates
 - uses persisted defaults for mode, freshness, and per-mode source caps unless the tool call overrides them
 - records when a default fast search had to be retried as deep/live
+- emits heartbeat progress while Codex is connecting or synthesizing, so a quiet backend is observable instead of looking hung
+- shows elapsed time, query budget, attempt number, JSONL event count, page inspections, and the last backend status in expanded tool details
 - uses Defuddle for direct URL-only requests and supports optional URL fallback when Codex cannot produce a usable result
 - returns a concise summary plus numbered sources with URLs and snippets
 
@@ -87,7 +90,7 @@ Parameters:
 - `query: string` — what to search for
 - `maxSources?: number` — optional cap from 1 to 10. If omitted, the saved fast/deep default is used for the chosen mode.
 - `mode?: "fast" | "deep"` — optional depth override. If omitted, the saved default mode is used.
-- `freshness?: "cached" | "live"` — optional freshness override. Use `live` for time-sensitive questions.
+- `freshness?: "cached" | "indexed" | "live"` — optional backend override. Indexed is the recommended general-purpose path; use live for time-sensitive questions.
 
 Behavior:
 
@@ -95,13 +98,13 @@ Behavior:
 - requires a non-empty query
 - defaults to saved settings of:
   - default mode = `fast`
-  - fast freshness = `cached`
+  - fast freshness = `indexed`
   - deep freshness = `live`
   - fast max sources = `5`
   - deep max sources = `5`
 - supports explicit `deep` mode for broader research
-- supports explicit `cached`/`live` freshness overrides
-- keeps `cached` as the default for normal fast lookups and only auto-promotes to `live` for strong recency cues like `today`, `latest`, `current`, `now`, `weather`, `price`, `breaking`, and `urgent`
+- supports explicit `cached`/`indexed`/`live` freshness overrides
+- keeps `indexed` as the default for normal fast lookups and auto-promotes to `live` for strong recency cues like `today`, `latest`, `current`, `now`, `weather`, `price`, `breaking`, and `urgent`
 - uses Defuddle immediately when the query is just a URL (including `https://defuddle.md/<url>` mirrors) when `defuddle-mode` allows direct extraction
 - automatically retries one recoverable default fast search as `deep` + `live` when Codex times out, burns through the fast query budget, loses transport, or fails to emit a usable final response
 - strengthens the Codex prompt with hard budget awareness plus targeted guidance for site-constrained and documentation-style queries
@@ -141,7 +144,7 @@ You can also use direct subcommands:
 ```text
 /web-search-settings status
 /web-search-settings default-mode deep
-/web-search-settings fast-freshness cached
+/web-search-settings fast-freshness indexed
 /web-search-settings deep-freshness live
 /web-search-settings fast-max-sources 5
 /web-search-settings deep-max-sources 5
