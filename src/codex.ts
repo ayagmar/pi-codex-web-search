@@ -212,18 +212,23 @@ export function buildCodexPrompt(
           "This is a quick lookup.",
           "Use as few web searches as possible and stop once you have enough information to answer.",
           "Do not do exhaustive query reformulations for simple factual questions.",
+          "Prefer one well-targeted search plus page inspection over a chain of near-duplicate searches.",
         ];
 
   return [
     "You are performing web research for another coding agent.",
     "Search the public web and answer the user's query using current online sources.",
+    "Treat the user's wording as a precise research brief: preserve named products, versions, dates, locations, quoted terms, site constraints, and comparison criteria.",
+    "Answer the exact question asked. Do not substitute a related question just because it is easier to search.",
+    "Prefer primary, official, or first-party sources; cross-check important claims and distinguish facts from uncertainty.",
     ...modeInstructions,
     ...buildPromptStrategyHints(query, mode, options.queryBudget),
     "Return only a JSON object that matches the provided schema.",
     "Do not wrap the JSON in markdown fences or add any extra commentary.",
     `Keep the summary concise and useful for another agent. Limit the source list to at most ${maxSources} items.`,
-    "Prefer primary or official sources when available.",
-    "Each source snippet should be short and directly relevant.",
+    "Every source must be a real HTTP(S) URL that directly supports the summary.",
+    "Each source snippet should be short and directly relevant; never invent a citation.",
+    "If authoritative evidence is unavailable, say so plainly instead of guessing.",
     "",
     `User query: ${query}`,
   ].join("\n");
@@ -306,7 +311,10 @@ export function parseCodexWebSearchOutput(raw: string, maxSources: number): Code
   }
 
   const summary = parsed.summary.trim();
-  const sources = parsed.sources.map(normalizeSource).filter(hasUsableSource).slice(0, maxSources);
+  const sources = dedupeSources(parsed.sources.map(normalizeSource).filter(hasUsableSource)).slice(
+    0,
+    maxSources
+  );
 
   if (!summary) {
     throw new Error("Codex returned an empty summary.");
@@ -518,6 +526,8 @@ async function runResolvedCodexWebSearch(
   const { query, maxSources, mode, freshness } = input;
   const policy = getSearchPolicy(mode, settings);
   const progress = createSearchProgress(query, mode, freshness);
+  progress.queryBudget = policy.queryBudget;
+  progress.attempt = retry ? 2 : 1;
   const tempDir = await mkdtemp(join(tmpdir(), "pi-codex-web-search-"));
   const outputPath = join(tempDir, "result.json");
   let warnedAtFastBudget = false;
@@ -534,6 +544,12 @@ async function runResolvedCodexWebSearch(
 
   const abortController = new AbortController();
   const signal = mergeAbortSignals(options.signal, abortController);
+  const heartbeatId = setInterval(() => {
+    if (!signal.aborted) {
+      emitProgressUpdate(options, progress, buildHeartbeatStatus(progress, policy.timeoutMs));
+    }
+  }, 8_000);
+  heartbeatId.unref?.();
 
   try {
     const runnerOptions: RunCodexCommandOptions = {
@@ -597,6 +613,12 @@ async function runResolvedCodexWebSearch(
           );
         }
       },
+      onStderrLine: (line) => {
+        const normalized = line.trim();
+        if (normalized && /reconnect|transport|network|websocket|https/i.test(normalized)) {
+          emitProgressUpdate(options, progress, normalized);
+        }
+      },
     };
 
     let runResult: RunCodexCommandResult;
@@ -641,6 +663,12 @@ async function runResolvedCodexWebSearch(
       throw asError(failure, progress);
     }
 
+    updateProgressElapsed(progress);
+    emitProgressUpdate(
+      options,
+      progress,
+      "Codex finished; validating sources and formatting the answer."
+    );
     const formattedResult = formatWebSearchResult(parsed);
     const renderedResult = await renderToolResult(formattedResult);
 
@@ -652,6 +680,7 @@ async function runResolvedCodexWebSearch(
       searchQueries: [...progress.searchQueries],
       pageActions: [...(progress.pageActions ?? [])],
       statusEvents: [...progress.statusEvents],
+      ...optionalProgressDetails(progress),
       sourceCount: parsed.sources.length,
       summary: parsed.summary,
       sources: parsed.sources,
@@ -675,6 +704,7 @@ async function runResolvedCodexWebSearch(
       details,
     };
   } finally {
+    clearInterval(heartbeatId);
     await rm(tempDir, { recursive: true, force: true });
   }
 }
@@ -689,6 +719,7 @@ async function buildSoftFailureResult(
   details: CodexWebSearchDetails;
 }> {
   const summary = buildSoftFailureSummary(failure, retry);
+  updateProgressElapsed(progress);
   const renderedResult = await renderToolResult(buildSoftFailureBody(summary, failure));
 
   const details: CodexWebSearchDetails = {
@@ -699,6 +730,7 @@ async function buildSoftFailureResult(
     searchQueries: [...progress.searchQueries],
     pageActions: [...(progress.pageActions ?? [])],
     statusEvents: [...progress.statusEvents],
+    ...optionalProgressDetails(progress),
     sourceCount: 0,
     summary,
     sources: [],
@@ -844,7 +876,13 @@ async function maybeRunDefuddleSearch(
     snippet: buildDefuddleSnippet(result),
   }));
   const summary = buildDefuddleSummary(results, defuddle);
-  const renderedResult = await renderToolResult(formatWebSearchResult({ summary, sources }));
+  const directContent = defuddle.directUrlQuery
+    ? `\n\nExtracted content:\n${results[0]?.content.trim() ?? ""}`
+    : "";
+  updateProgressElapsed(progress);
+  const renderedResult = await renderToolResult(
+    `${formatWebSearchResult({ summary, sources })}${directContent}`
+  );
   const details: CodexWebSearchDetails = {
     query: input.query,
     mode: input.mode,
@@ -853,6 +891,7 @@ async function maybeRunDefuddleSearch(
     searchQueries: [...progress.searchQueries],
     pageActions: [...(progress.pageActions ?? [])],
     statusEvents: [...progress.statusEvents],
+    ...optionalProgressDetails(progress),
     sourceCount: sources.length,
     summary,
     sources,
@@ -1253,10 +1292,14 @@ function createSearchProgress(
     searchQueries: [],
     pageActions: [],
     statusEvents: [],
+    eventCount: 0,
+    startedAt: Date.now(),
   };
 }
 
 function cloneProgress(progress: WebSearchProgressDetails): WebSearchProgressDetails {
+  updateProgressElapsed(progress);
+
   return {
     query: progress.query,
     mode: progress.mode,
@@ -1267,7 +1310,45 @@ function cloneProgress(progress: WebSearchProgressDetails): WebSearchProgressDet
     statusEvents: [...progress.statusEvents],
     ...(progress.latestQuery ? { latestQuery: progress.latestQuery } : {}),
     ...(progress.statusText ? { statusText: progress.statusText } : {}),
+    ...(progress.elapsedMs !== undefined ? { elapsedMs: progress.elapsedMs } : {}),
+    ...(progress.queryBudget !== undefined ? { queryBudget: progress.queryBudget } : {}),
+    ...(progress.attempt !== undefined ? { attempt: progress.attempt } : {}),
+    ...(progress.eventCount !== undefined ? { eventCount: progress.eventCount } : {}),
   };
+}
+
+function optionalProgressDetails(
+  progress: WebSearchProgressDetails
+): Pick<WebSearchProgressDetails, "elapsedMs" | "queryBudget" | "attempt" | "eventCount"> {
+  return {
+    ...(progress.elapsedMs !== undefined ? { elapsedMs: progress.elapsedMs } : {}),
+    ...(progress.queryBudget !== undefined ? { queryBudget: progress.queryBudget } : {}),
+    ...(progress.attempt !== undefined ? { attempt: progress.attempt } : {}),
+    ...(progress.eventCount !== undefined ? { eventCount: progress.eventCount } : {}),
+  };
+}
+
+function updateProgressElapsed(progress: WebSearchProgressDetails): void {
+  if (progress.startedAt !== undefined) {
+    progress.elapsedMs = Math.max(0, Date.now() - progress.startedAt);
+  }
+}
+
+function buildHeartbeatStatus(progress: WebSearchProgressDetails, timeoutMs: number): string {
+  const elapsed = formatElapsed(progress.elapsedMs ?? 0);
+  const budget = progress.queryBudget
+    ? ` · ${progress.searchCount}/${progress.queryBudget} searches`
+    : "";
+  const phase =
+    progress.searchCount > 0 ? "researching and inspecting pages" : "waiting for search activity";
+  return `Still ${phase} · ${elapsed}${budget} (timeout ${formatElapsed(timeoutMs)})`;
+}
+
+function formatElapsed(milliseconds: number): string {
+  const seconds = Math.max(0, Math.round(milliseconds / 1_000));
+  if (seconds < 60) return `${seconds}s`;
+  const minutes = Math.floor(seconds / 60);
+  return `${minutes}m ${String(seconds % 60).padStart(2, "0")}s`;
 }
 
 function emitProgressUpdate(
@@ -1276,6 +1357,7 @@ function emitProgressUpdate(
   text: string
 ): void {
   progress.statusText = text;
+  updateProgressElapsed(progress);
 
   const details = cloneProgress(progress);
 
@@ -1309,6 +1391,9 @@ function collectProgressUpdates(
   line: string
 ): { queries: string[]; pageActions: string[]; statuses: string[] } {
   const event = parseJsonObject(line);
+  if (event) {
+    progress.eventCount = (progress.eventCount ?? 0) + 1;
+  }
   if (!event) {
     return { queries: [], pageActions: [], statuses: [] };
   }
@@ -1701,7 +1786,38 @@ function isWebSearchSource(value: unknown): value is LooseWebSearchSource {
 }
 
 function hasUsableSource(source: WebSearchSource): boolean {
-  return source.title.length > 0 && source.url.length > 0;
+  if (!source.title || !source.url) {
+    return false;
+  }
+
+  try {
+    const url = new URL(source.url);
+    return url.protocol === "http:" || url.protocol === "https:";
+  } catch {
+    return false;
+  }
+}
+
+function dedupeSources(sources: WebSearchSource[]): WebSearchSource[] {
+  const seenUrls = new Set<string>();
+  return sources.filter((source) => {
+    const key = sourceUrlKey(source.url);
+    if (seenUrls.has(key)) {
+      return false;
+    }
+    seenUrls.add(key);
+    return true;
+  });
+}
+
+function sourceUrlKey(value: string): string {
+  try {
+    const url = new URL(value);
+    // Host names and schemes are case-insensitive; paths remain case-sensitive.
+    return `${url.protocol}//${url.hostname.toLowerCase()}${url.port ? `:${url.port}` : ""}${url.pathname}${url.search}${url.hash}`;
+  } catch {
+    return value;
+  }
 }
 
 function normalizeSource(source: LooseWebSearchSource): WebSearchSource {

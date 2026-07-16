@@ -1,7 +1,7 @@
 import type { AgentToolUpdateCallback } from "@earendil-works/pi-coding-agent";
 
 export type SearchMode = "fast" | "deep";
-export type SearchFreshness = "cached" | "live";
+export type SearchFreshness = "cached" | "indexed" | "live";
 export type DefuddleMode = "off" | "direct" | "fallback" | "both";
 export type CodexFailureKind =
   | "transport"
@@ -49,6 +49,16 @@ export interface WebSearchProgressDetails {
   pageActions?: string[];
   latestQuery?: string;
   statusText?: string;
+  /** Milliseconds since the current Codex attempt started. */
+  elapsedMs?: number;
+  /** Maximum number of web-search actions allowed for this attempt. */
+  queryBudget?: number;
+  /** Number of Codex subprocess attempts, including retries. */
+  attempt?: number;
+  /** Number of JSONL events observed from Codex. */
+  eventCount?: number;
+  /** Internal monotonic-ish wall-clock start marker, omitted from rendered details. */
+  startedAt?: number;
   statusEvents: string[];
 }
 
@@ -97,6 +107,7 @@ export interface RunCodexCommandOptions {
   signal?: AbortSignal;
   timeoutMs?: number;
   onStdoutLine?: (line: string) => void;
+  onStderrLine?: (line: string) => void;
 }
 
 export interface RunCodexCommandResult {

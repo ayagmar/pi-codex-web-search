@@ -41,8 +41,10 @@ const SETTINGS_ARGUMENT_OPTIONS = [
   "default-mode fast",
   "default-mode deep",
   "fast-freshness cached",
+  "fast-freshness indexed",
   "fast-freshness live",
   "deep-freshness cached",
+  "deep-freshness indexed",
   "deep-freshness live",
   "fast-max-sources 5",
   "deep-max-sources 5",
@@ -72,7 +74,7 @@ export default function codexWebSearchExtension(pi: ExtensionAPI) {
     name: TOOL_NAME,
     label: "Web Search",
     description:
-      "Search the public web through the locally installed Codex CLI and return a concise summary with sources. Use fast mode for quick factual lookups and deep mode only when the user explicitly wants broader research. Freshness can be cached or live, with live preferred for clearly time-sensitive requests. Defuddle can be used for direct URL extraction and optional URL fallback behavior. Timeouts, budgets, Defuddle behavior, and per-mode defaults are configurable via /web-search-settings. Output is truncated to Pi's standard limits when needed. Requires `codex` to be installed and authenticated on this machine.",
+      "Search the public web through the locally installed Codex CLI and return a concise, source-backed answer. Use fast mode for normal lookups and deep mode for comparisons or broader research. Indexed search is the low-latency default; live search is used for clearly time-sensitive requests. Preserve the user's exact scope, constraints, dates, and named sites. Defuddle can extract direct URLs and optionally recover URL-based requests. Progress exposes the active phase, query count, budget, elapsed time, page inspections, retries, and failure cause. Timeouts, budgets, Defuddle behavior, and per-mode defaults are configurable via /web-search-settings. Output is truncated to Pi's standard limits when needed. Requires `codex` to be installed and authenticated on this machine.",
     parameters: Type.Object({
       query: Type.String({ description: "What to search for on the web" }),
       maxSources: Type.Optional(
@@ -90,9 +92,9 @@ export default function codexWebSearchExtension(pi: ExtensionAPI) {
         })
       ),
       freshness: Type.Optional(
-        StringEnum(["cached", "live"] as const, {
+        StringEnum(["cached", "indexed", "live"] as const, {
           description:
-            "Freshness override. Use live for time-sensitive questions like today, latest, score, result, or weather.",
+            "Search backend override. Indexed is fast and broadly useful, cached is fastest but may be stale, and live is for time-sensitive questions like today, latest, score, result, or weather.",
         })
       ),
     }),
@@ -150,6 +152,12 @@ export default function codexWebSearchExtension(pi: ExtensionAPI) {
         "muted",
         ` from ${details.searchCount} search${details.searchCount === 1 ? "" : "es"} [${details.mode}/${details.freshness}]`
       );
+      if (details.elapsedMs !== undefined) {
+        text += theme.fg("dim", ` · ${formatElapsed(details.elapsedMs)}`);
+      }
+      if (details.queryBudget !== undefined) {
+        text += theme.fg("dim", ` · budget ${details.searchCount}/${details.queryBudget}`);
+      }
 
       if (details.truncated) {
         text += theme.fg("warning", " (truncated)");
@@ -179,6 +187,22 @@ export default function codexWebSearchExtension(pi: ExtensionAPI) {
       }
 
       text += `\n${theme.fg("muted", `Original request: ${details.query}`)}`;
+      if (
+        details.elapsedMs !== undefined ||
+        details.attempt !== undefined ||
+        details.eventCount !== undefined
+      ) {
+        const diagnostics = [
+          details.elapsedMs !== undefined
+            ? `elapsed ${formatElapsed(details.elapsedMs)}`
+            : undefined,
+          details.attempt !== undefined ? `attempt ${details.attempt}` : undefined,
+          details.eventCount !== undefined ? `${details.eventCount} Codex events` : undefined,
+        ]
+          .filter(Boolean)
+          .join(" · ");
+        text += `\n${theme.fg("dim", `Run diagnostics: ${diagnostics}`)}`;
+      }
       if (details.retry) {
         text += `\n${theme.fg("warning", formatRetrySummary(details.retry))}`;
         text += `\n${theme.fg("dim", details.retry.fallbackReason)}`;
@@ -435,28 +459,27 @@ async function openSearchDefaultsDialog(ctx: ExtensionCommandContext): Promise<v
       const freshness = await ctx.ui.select(
         "Fast freshness\nDefault freshness for fast searches when the tool call does not override it.",
         [
-          "cached — faster and usually enough for stable topics",
-          "live — fresher results for time-sensitive lookups",
+          "indexed — fast hosted index; recommended default",
+          "cached — fastest, but may be stale",
+          "live — freshest results for time-sensitive lookups",
         ]
       );
       if (!freshness) continue;
-      await handleSettingsCommand(
-        `fast-freshness ${freshness.startsWith("live") ? "live" : "cached"}`,
-        ctx
-      );
+      await handleSettingsCommand(`fast-freshness ${parseFreshnessChoice(freshness)}`, ctx);
       continue;
     }
 
     if (choice.startsWith("Deep freshness")) {
       const freshness = await ctx.ui.select(
         "Deep freshness\nDefault freshness for deep research when the tool call does not override it.",
-        ["cached — use cached search results", "live — prefer the freshest search results"]
+        [
+          "indexed — use the hosted index",
+          "cached — use cached search results",
+          "live — prefer the freshest search results",
+        ]
       );
       if (!freshness) continue;
-      await handleSettingsCommand(
-        `deep-freshness ${freshness.startsWith("live") ? "live" : "cached"}`,
-        ctx
-      );
+      await handleSettingsCommand(`deep-freshness ${parseFreshnessChoice(freshness)}`, ctx);
       continue;
     }
 
@@ -599,8 +622,8 @@ function buildSettingsHelp(settings: WebSearchSettings): string {
     "Commands:",
     "Search defaults:",
     `/${SETTINGS_COMMAND} default-mode <fast|deep>`,
-    `/${SETTINGS_COMMAND} fast-freshness <cached|live>`,
-    `/${SETTINGS_COMMAND} deep-freshness <cached|live>`,
+    `/${SETTINGS_COMMAND} fast-freshness <cached|indexed|live>`,
+    `/${SETTINGS_COMMAND} deep-freshness <cached|indexed|live>`,
     `/${SETTINGS_COMMAND} fast-max-sources <1-${MAX_ALLOWED_SOURCES}>`,
     `/${SETTINGS_COMMAND} deep-max-sources <1-${MAX_ALLOWED_SOURCES}>`,
     `/${SETTINGS_COMMAND} default-max-sources <1-${MAX_ALLOWED_SOURCES}>  (legacy alias: sets both)`,
@@ -639,10 +662,14 @@ function parseMode(value: string): SearchMode {
 }
 
 function parseFreshness(value: string): SearchFreshness {
-  if (value === "cached" || value === "live") {
+  if (value === "cached" || value === "indexed" || value === "live") {
     return value;
   }
-  throw new Error(`Invalid freshness: ${value}. Expected cached or live.`);
+  throw new Error(`Invalid freshness: ${value}. Expected cached, indexed, or live.`);
+}
+
+function parseFreshnessChoice(choice: string): SearchFreshness {
+  return parseFreshness(choice.split(" ", 1)[0] ?? "");
 }
 
 function parseDefuddleMode(value: string): DefuddleMode {
@@ -689,7 +716,9 @@ function hasRenderableResultDetails(
   return (
     !!details &&
     (details.mode === "fast" || details.mode === "deep") &&
-    (details.freshness === "cached" || details.freshness === "live") &&
+    (details.freshness === "cached" ||
+      details.freshness === "indexed" ||
+      details.freshness === "live") &&
     typeof details.query === "string" &&
     typeof details.sourceCount === "number" &&
     typeof details.searchCount === "number" &&
@@ -711,15 +740,17 @@ function renderProgress(
 ): string {
   const searchCount = details?.searchCount ?? 0;
   const mode = details?.mode ?? "fast";
-  const freshness = details?.freshness ?? "cached";
+  const freshness = details?.freshness ?? "indexed";
   const statusText = details?.statusText ?? "Searching the web";
   const statusEvents = details?.statusEvents ?? [];
   const pageActions = details?.pageActions ?? [];
 
   let text = theme.fg("warning", statusText);
+  const budget = details?.queryBudget !== undefined ? `/${details.queryBudget}` : "";
+  const elapsed = details?.elapsedMs !== undefined ? ` · ${formatElapsed(details.elapsedMs)}` : "";
   text += theme.fg(
     "muted",
-    ` [${mode}/${freshness}] · ${searchCount} ${searchCount === 1 ? "query" : "queries"} so far`
+    ` [${mode}/${freshness}] · ${searchCount}${budget} ${searchCount === 1 ? "query" : "queries"}${elapsed}`
   );
 
   if (!expanded) {
@@ -823,6 +854,13 @@ function formatToolOutput(
     .split("\n")
     .map((line) => theme.fg("toolOutput", line))
     .join("\n");
+}
+
+function formatElapsed(milliseconds: number): string {
+  const seconds = Math.max(0, Math.round(milliseconds / 1_000));
+  if (seconds < 60) return `${seconds}s`;
+  const minutes = Math.floor(seconds / 60);
+  return `${minutes}m ${String(seconds % 60).padStart(2, "0")}s`;
 }
 
 function formatInlineQuery(query: unknown, maxLength = 90): string {

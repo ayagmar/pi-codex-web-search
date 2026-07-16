@@ -148,6 +148,23 @@ async function isExecutableFile(path: string): Promise<boolean> {
   }
 }
 
+function terminateChild(
+  child: ReturnType<typeof spawn>,
+  afterTerminate?: () => void,
+  signal: NodeJS.Signals = "SIGTERM"
+): void {
+  try {
+    if (process.platform !== "win32" && child.pid) {
+      process.kill(-child.pid, signal);
+    } else {
+      child.kill(signal);
+    }
+  } catch {
+    // The process may have exited between the timeout/abort and the kill.
+  }
+  afterTerminate?.();
+}
+
 function spawnCodexCommand(
   command: string,
   options: RunCodexCommandOptions
@@ -157,6 +174,9 @@ function spawnCodexCommand(
       cwd: options.cwd,
       stdio: ["pipe", "pipe", "pipe"],
       env: process.env,
+      // Put Codex in its own process group so a timeout cannot leave a
+      // spawned network/helper process running after Pi has moved on.
+      detached: process.platform !== "win32",
     });
 
     let stdout = "";
@@ -164,6 +184,7 @@ function spawnCodexCommand(
     let stdoutLineBuffer = "";
     let settled = false;
     let timeoutId: NodeJS.Timeout | undefined;
+    let forceKillId: NodeJS.Timeout | undefined;
 
     const finish = (callback: () => void): void => {
       if (settled) return;
@@ -174,7 +195,10 @@ function spawnCodexCommand(
     };
 
     const onAbort = (): void => {
-      child.kill("SIGTERM");
+      terminateChild(child, () => {
+        forceKillId = setTimeout(() => terminateChild(child, undefined, "SIGKILL"), 2_000);
+        forceKillId.unref?.();
+      });
       const reason: unknown = options.signal?.reason;
       const error =
         reason instanceof Error
@@ -191,7 +215,10 @@ function spawnCodexCommand(
     if (options.timeoutMs !== undefined) {
       const timeoutMs = options.timeoutMs;
       timeoutId = setTimeout(() => {
-        child.kill("SIGTERM");
+        terminateChild(child, () => {
+          forceKillId = setTimeout(() => terminateChild(child, undefined, "SIGKILL"), 2_000);
+          forceKillId.unref?.();
+        });
         finish(() => {
           reject(
             new Error(`Codex web search timed out after ${Math.ceil(timeoutMs / 1000)} seconds.`)
@@ -226,13 +253,25 @@ function spawnCodexCommand(
     });
 
     child.stderr.setEncoding("utf-8");
+    let stderrLineBuffer = "";
     child.stderr.on("data", (chunk: string) => {
       stderr += chunk;
+      stderrLineBuffer += chunk;
+
+      let newlineIndex = stderrLineBuffer.indexOf("\n");
+      while (newlineIndex >= 0) {
+        options.onStderrLine?.(stderrLineBuffer.slice(0, newlineIndex));
+        stderrLineBuffer = stderrLineBuffer.slice(newlineIndex + 1);
+        newlineIndex = stderrLineBuffer.indexOf("\n");
+      }
     });
 
     child.on("close", (code) => {
       if (stdoutLineBuffer) {
         options.onStdoutLine?.(stdoutLineBuffer);
+      }
+      if (stderrLineBuffer) {
+        options.onStderrLine?.(stderrLineBuffer);
       }
       finish(() => resolve({ code: code ?? 1, stdout, stderr }));
     });

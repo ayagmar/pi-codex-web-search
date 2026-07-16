@@ -92,14 +92,14 @@ void test("isLiveFreshnessQuery detects strong recency signals", () => {
 });
 
 void test("resolveSearchFreshness honors explicit overrides and auto-live hints", () => {
-  assert.equal(resolveSearchFreshness({ query: "typescript decorators guide" }, "fast"), "cached");
+  assert.equal(resolveSearchFreshness({ query: "typescript decorators guide" }, "fast"), "indexed");
   assert.equal(resolveSearchFreshness({ query: "did sentinels win today" }, "fast"), "live");
   assert.equal(
     resolveSearchFreshness(
       { query: "did sentinels win or lose their valorant game on february 7th" },
       "fast"
     ),
-    "cached"
+    "indexed"
   );
   assert.equal(
     resolveSearchFreshness({ query: "weather now", freshness: "cached" }, "fast"),
@@ -246,6 +246,25 @@ void test("parseCodexWebSearchOutput validates and trims sources", () => {
   ]);
 });
 
+void test("parseCodexWebSearchOutput drops invalid and duplicate sources", () => {
+  const parsed = parseCodexWebSearchOutput(
+    JSON.stringify({
+      summary: "Validated source filtering.",
+      sources: [
+        { title: "Official", url: "https://example.com/docs", snippet: "Useful." },
+        { title: "Duplicate", url: "https://EXAMPLE.com/docs", snippet: "Same page." },
+        { title: "Local", url: "file:///tmp/not-web", snippet: "Not a web source." },
+        { title: "Malformed", url: "not a URL", snippet: "Not a web source." },
+      ],
+    }),
+    10
+  );
+
+  assert.deepEqual(parsed.sources, [
+    { title: "Official", url: "https://example.com/docs", snippet: "Useful." },
+  ]);
+});
+
 void test("parseCodexWebSearchOutput extracts fenced JSON and tolerates missing snippets", () => {
   const parsed = parseCodexWebSearchOutput(
     [
@@ -363,9 +382,13 @@ void test("executeCodexWebSearch returns formatted content from codex output", a
   assert.match(result.content[0]?.text ?? "", /Codex CLI can be wrapped by a Pi tool\./);
   assert.equal(result.details.query, "pi extension web search");
   assert.equal(result.details.mode, "fast");
-  assert.equal(result.details.freshness, "cached");
+  assert.equal(result.details.freshness, "indexed");
   assert.equal(result.details.sourceCount, 1);
   assert.equal(result.details.searchCount, 2);
+  assert.equal(result.details.queryBudget, 10);
+  assert.equal(result.details.attempt, 1);
+  assert.ok((result.details.elapsedMs ?? 0) >= 0);
+  assert.equal(result.details.eventCount, 2);
   assert.deepEqual(result.details.searchQueries, [
     "developers.openai.com codex cli reference",
     "codex exec reference official docs",
@@ -473,6 +496,8 @@ void test("executeCodexWebSearch uses Defuddle directly for URL-only queries", a
   ]);
   assert.match(result.details.summary, /Defuddle extracted clean content directly/);
   assert.equal(result.details.sources[0]?.title, "Features – Codex CLI | OpenAI Developers");
+  assert.match(result.content[0]?.text ?? "", /Extracted content:/);
+  assert.match(result.content[0]?.text ?? "", /Codex supports workflows beyond chat\./);
 });
 
 void test("executeCodexWebSearch rethrows Defuddle cancellations", async () => {
@@ -531,7 +556,7 @@ void test("executeCodexWebSearch falls back to Defuddle for URL-based requests w
   assert.deepEqual(result.details.retry, {
     retriedFromFast: true,
     originalMode: "fast",
-    originalFreshness: "cached",
+    originalFreshness: "indexed",
     fallbackReason: "Codex web search timed out after 90 seconds.",
   });
   assert.equal(result.details.defuddle?.directUrlQuery, false);
@@ -655,7 +680,7 @@ void test("executeCodexWebSearch does not use Defuddle fallback for generic URL 
   assert.deepEqual(result.details.retry, {
     retriedFromFast: true,
     originalMode: "fast",
-    originalFreshness: "cached",
+    originalFreshness: "indexed",
     fallbackReason: "Codex web search timed out after 90 seconds.",
   });
   assert.match(result.content[0]?.text ?? "", /could not produce a usable result/i);
@@ -939,7 +964,7 @@ void test("executeCodexWebSearch retries default fast searches as deep/live afte
   );
 
   assert.equal(attempts.length, 2);
-  assert.ok(attempts[0]?.args.includes('web_search="cached"'));
+  assert.ok(attempts[0]?.args.includes('web_search="indexed"'));
   assert.ok(attempts[0]?.stdin?.includes("This is a quick lookup."));
   assert.ok(attempts[1]?.args.includes('web_search="live"'));
   assert.ok(attempts[1]?.stdin?.includes("This is a deeper research task."));
@@ -948,7 +973,7 @@ void test("executeCodexWebSearch retries default fast searches as deep/live afte
   assert.deepEqual(result.details.retry, {
     retriedFromFast: true,
     originalMode: "fast",
-    originalFreshness: "cached",
+    originalFreshness: "indexed",
     fallbackReason: "Codex web search timed out after 90 seconds.",
   });
   assert.match(result.content[0]?.text ?? "", /Recovered on deep\/live retry\./);
@@ -1002,7 +1027,7 @@ void test("executeCodexWebSearch keeps retry provenance when Defuddle handles a 
   assert.deepEqual(result.details.retry, {
     retriedFromFast: true,
     originalMode: "fast",
-    originalFreshness: "cached",
+    originalFreshness: "indexed",
     fallbackReason: "Codex web search timed out after 90 seconds.",
   });
   assert.equal(

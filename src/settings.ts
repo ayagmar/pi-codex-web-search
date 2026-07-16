@@ -19,7 +19,10 @@ import type { DefuddleMode, SearchFreshness, SearchMode, WebSearchSettings } fro
 
 export const DEFAULT_WEB_SEARCH_SETTINGS: WebSearchSettings = {
   defaultMode: "fast",
-  fastFreshness: "cached",
+  // Indexed search is Codex's best low-latency default: it uses the hosted
+  // index without waiting for a live crawl. Recency-sensitive queries still
+  // promote themselves to live in resolveSearchFreshness().
+  fastFreshness: "indexed",
   deepFreshness: "live",
   fastMaxSources: DEFAULT_FAST_MAX_SOURCES,
   deepMaxSources: DEFAULT_DEEP_MAX_SOURCES,
@@ -175,7 +178,7 @@ function asMode(value: unknown, fallback: SearchMode): SearchMode {
 }
 
 function asFreshness(value: unknown, fallback: SearchFreshness): SearchFreshness {
-  return value === "cached" || value === "live" ? value : fallback;
+  return value === "cached" || value === "indexed" || value === "live" ? value : fallback;
 }
 
 function asDefuddleMode(value: unknown, fallback: DefuddleMode): DefuddleMode {
