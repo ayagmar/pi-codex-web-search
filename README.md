@@ -14,6 +14,7 @@ When Pi calls `web_search`, the extension auto-resolves a usable Codex binary, t
 
 - `codex exec --json`
 - `-c web_search="indexed"`, `-c web_search="cached"`, or `-c web_search="live"`
+- `-c model_reasoning_effort="low"` for fast mode or `"medium"` for deep mode
 - read-only sandbox
 - ephemeral session
 - structured JSON output enforced with `--output-schema`
@@ -27,15 +28,20 @@ usually more useful than a stale cache without paying the latency of a live craw
 The extension then:
 
 - parses Codex JSONL events to show search progress in Pi
-- tracks the actual search queries Codex issued across multiple item event shapes
-- keeps page opens/find-in-page activity separate so document inspection does not incorrectly consume the query budget
-- keeps a running search counter in the tool UI
-- shows clearer in-flight status when fast mode nears its budget or auto-escalates
+- tracks the actual search queries Codex issued across multiple item event shapes without double-counting Codex's abbreviated display query
+- budgets `web_search` tool calls rather than individual query strings batched inside one call
+- keeps page opens/find-in-page activity separate so document inspection does not consume the search-call budget
+- prevents differing sibling `web_search` calls from running concurrently; related subquestions must share one request
+- coalesces identical concurrent searches onto one Codex run and serves repeated identical requests within a turn from a small result cache
+- keeps running query and search-call counters in the tool UI
+- shows clearer in-flight status when fast mode nears its search-call budget
 - uses persisted defaults for mode, freshness, and per-mode source caps unless the tool call overrides them
-- records when a default fast search had to be retried as deep/live
+- records when a default fast search had to be retried as deep/live after a transport failure
 - emits heartbeat progress while Codex is connecting or synthesizing, so a quiet backend is observable instead of looking hung
-- shows elapsed time, query budget, attempt number, JSONL event count, page inspections, and the last backend status in expanded tool details
-- uses Defuddle for direct URL-only requests and supports optional URL fallback when Codex cannot produce a usable result
+- applies phase-aware inactivity deadlines: a run with no backend events within 30s fails as a dead connection, and a run whose events stop for 60s mid-research fails as stalled, both well before the wall-clock timeout
+- caps captured subprocess output so runaway Codex or Defuddle processes cannot exhaust memory
+- shows elapsed time, search-call budget, attempt number, JSONL event count, page inspections, and the last backend status in expanded tool details
+- uses Defuddle for direct URL-only requests and supports optional URL fallback when Codex cannot produce a usable result; fallback answers include a bounded excerpt of the extracted page content
 - returns a concise summary plus numbered sources with URLs and snippets
 
 ## Requirements
@@ -106,18 +112,20 @@ Behavior:
 - supports explicit `cached`/`indexed`/`live` freshness overrides
 - keeps `indexed` as the default for normal fast lookups and auto-promotes to `live` for strong recency cues like `today`, `latest`, `current`, `now`, `weather`, `price`, `breaking`, and `urgent`
 - uses Defuddle immediately when the query is just a URL (including `https://defuddle.md/<url>` mirrors) when `defuddle-mode` allows direct extraction
-- automatically retries one recoverable default fast search as `deep` + `live` when Codex times out, burns through the fast query budget, loses transport, or fails to emit a usable final response
-- strengthens the Codex prompt with hard budget awareness plus targeted guidance for site-constrained and documentation-style queries
+- automatically retries one default fast search as `deep` + `live` when Codex loses transport mid-run; timeouts and budget exhaustion fail fast instead of silently paying for a second, longer attempt
+- constrains fast mode to one batched search call before synthesis and forces low Codex reasoning effort so simple lookups do not inherit a slow global reasoning setting
+- uses medium Codex reasoning effort for deep mode and strengthens prompts with targeted guidance for site-constrained and documentation-style queries
 - shows reconnects, WebSocket-to-HTTPS fallback, and the final classified failure cause in tool progress/details when they happen
 - can fall back to Defuddle for single-URL extraction-style requests when Codex still fails after its own retries, if `defuddle-mode` enables fallback
 - falls back to Codex's final JSONL agent message if `--output-last-message` comes back empty, including newer raw `response.output_item.*` assistant events as a compatibility path
 - tolerates fenced or wrapped JSON when Codex produces the right object with extra surrounding text
 - treats `turn.failed`, `response.*.failed`, and `error` JSONL events as first-class failure signals
-- enforces smaller time/query budgets in fast mode so lightweight lookups do not run indefinitely
-- counts only real web searches against those budgets, not `open_page` or `find_in_page` follow-up actions
-- warns when fast mode has consumed its full query budget and is about to fail or auto-escalate
+- enforces smaller timeout/search-call budgets in fast mode so lightweight lookups do not run indefinitely
+- counts each real `web_search` tool call once, even when it batches many query strings or emits both started/completed events
+- excludes `open_page` and `find_in_page` follow-up actions from the search-call budget
+- warns when fast mode has consumed its full search-call budget and is about to fail
 - blocks repeated fast-mode retries within the same turn after fast mode has already been exhausted
-- shows live search queries and a running search counter in Pi's tool UI
+- shows live search queries and separate query/call counters in Pi's tool UI
 - supports expanded tool details with `Ctrl+O`
 - returns a compact answer with sources
 - truncates oversized output and saves the full result to a temp file when needed
@@ -137,7 +145,7 @@ The interactive dialog is grouped into:
 - Search defaults
 - Defuddle behavior
 - Timeouts
-- Query budgets
+- Search-call budgets
 
 You can also use direct subcommands:
 
@@ -163,7 +171,7 @@ Notes:
 - `default-max-sources` is kept as a compatibility alias and updates both `fast-max-sources` and `deep-max-sources`.
 - The settings file is stored under your Pi agent directory and is reused by future sessions.
 - Defaults include `defuddle-mode = direct` for URL-only extraction without surprising non-URL search behavior.
-- Timeouts and search-query budgets are configurable for both fast and deep modes.
+- Timeouts and search-call budgets are configurable for both fast and deep modes. Existing `fast-query-budget` and `deep-query-budget` command names are retained for compatibility.
 
 Note: current Codex docs describe the top-level `web_search` setting as the supported configuration surface. Older legacy settings such as `features.web_search_request` are deprecated.
 
