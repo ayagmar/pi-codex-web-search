@@ -68,6 +68,6 @@
     "node": ">=22"
   },
   "dependencies": {
-    "defuddle": "0.14.0"
+    "defuddle": "0.19.1"
   }
 }
