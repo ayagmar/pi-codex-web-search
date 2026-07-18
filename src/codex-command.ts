@@ -18,6 +18,24 @@ const PACKAGE_ROOTS = [
   join(homedir(), "node_modules", "@openai"),
 ];
 
+// Cap accumulated subprocess output so a runaway Codex process or a huge
+// page cannot exhaust extension memory. Line callbacks still see every line;
+// only the aggregated stdout/stderr strings are bounded.
+export const MAX_CAPTURED_STDOUT_BYTES = 8 * 1024 * 1024;
+export const MAX_CAPTURED_STDERR_BYTES = 1024 * 1024;
+// A single JSONL line should never approach this; newline-free floods are
+// truncated to their tail (an incomplete line simply fails JSON parsing).
+export const MAX_LINE_BUFFER_BYTES = 2 * 1024 * 1024;
+
+export function appendBounded(buffer: string, chunk: string, maxBytes: number): string {
+  const combined = buffer + chunk;
+  if (combined.length <= maxBytes) {
+    return combined;
+  }
+  // Keep the tail: final agent messages and errors arrive last.
+  return combined.slice(combined.length - maxBytes);
+}
+
 let cachedBundledCodexPath: string | undefined;
 
 class CodexCommandNotFoundError extends Error {
@@ -194,11 +212,13 @@ function spawnCodexCommand(
       callback();
     };
 
+    const scheduleForceKill = (): void => {
+      forceKillId = setTimeout(() => terminateChild(child, undefined, "SIGKILL"), 2_000);
+      forceKillId.unref?.();
+    };
+
     const onAbort = (): void => {
-      terminateChild(child, () => {
-        forceKillId = setTimeout(() => terminateChild(child, undefined, "SIGKILL"), 2_000);
-        forceKillId.unref?.();
-      });
+      terminateChild(child, scheduleForceKill);
       const reason: unknown = options.signal?.reason;
       const error =
         reason instanceof Error
@@ -215,10 +235,7 @@ function spawnCodexCommand(
     if (options.timeoutMs !== undefined) {
       const timeoutMs = options.timeoutMs;
       timeoutId = setTimeout(() => {
-        terminateChild(child, () => {
-          forceKillId = setTimeout(() => terminateChild(child, undefined, "SIGKILL"), 2_000);
-          forceKillId.unref?.();
-        });
+        terminateChild(child, scheduleForceKill);
         finish(() => {
           reject(
             new Error(`Codex web search timed out after ${Math.ceil(timeoutMs / 1000)} seconds.`)
@@ -240,8 +257,8 @@ function spawnCodexCommand(
 
     child.stdout.setEncoding("utf-8");
     child.stdout.on("data", (chunk: string) => {
-      stdout += chunk;
-      stdoutLineBuffer += chunk;
+      stdout = appendBounded(stdout, chunk, MAX_CAPTURED_STDOUT_BYTES);
+      stdoutLineBuffer = appendBounded(stdoutLineBuffer, chunk, MAX_LINE_BUFFER_BYTES);
 
       let newlineIndex = stdoutLineBuffer.indexOf("\n");
       while (newlineIndex >= 0) {
@@ -255,8 +272,8 @@ function spawnCodexCommand(
     child.stderr.setEncoding("utf-8");
     let stderrLineBuffer = "";
     child.stderr.on("data", (chunk: string) => {
-      stderr += chunk;
-      stderrLineBuffer += chunk;
+      stderr = appendBounded(stderr, chunk, MAX_CAPTURED_STDERR_BYTES);
+      stderrLineBuffer = appendBounded(stderrLineBuffer, chunk, MAX_LINE_BUFFER_BYTES);
 
       let newlineIndex = stderrLineBuffer.indexOf("\n");
       while (newlineIndex >= 0) {
@@ -267,6 +284,9 @@ function spawnCodexCommand(
     });
 
     child.on("close", (code) => {
+      // The child is gone; a pending force-kill must not fire against a
+      // recycled PID or process group.
+      if (forceKillId) clearTimeout(forceKillId);
       if (stdoutLineBuffer) {
         options.onStdoutLine?.(stdoutLineBuffer);
       }

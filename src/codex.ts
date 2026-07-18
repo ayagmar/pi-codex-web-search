@@ -8,7 +8,11 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { MAX_ALLOWED_SOURCES } from "./constants.js";
+import {
+  MAX_ALLOWED_SOURCES,
+  STALL_INACTIVITY_TIMEOUT_MS,
+  STARTUP_INACTIVITY_TIMEOUT_MS,
+} from "./constants.js";
 import {
   buildDefuddleSnippet,
   buildDefuddleSummary,
@@ -210,7 +214,9 @@ export function buildCodexPrompt(
         ]
       : [
           "This is a quick lookup.",
-          "Use as few web searches as possible and stop once you have enough information to answer.",
+          "Use exactly one web_search tool call. Batch a few targeted query strings inside that single call when useful.",
+          "After that search call, answer immediately from the best evidence you have. Do not keep searching to eliminate every uncertainty.",
+          "Use page inspection when needed; open_page and find_in_page do not count as additional searches.",
           "Do not do exhaustive query reformulations for simple factual questions.",
           "Prefer one well-targeted search plus page inspection over a chain of near-duplicate searches.",
         ];
@@ -238,7 +244,9 @@ function buildPromptStrategyHints(query: string, mode: SearchMode, queryBudget?:
   const hints: string[] = [];
 
   if (queryBudget !== undefined) {
-    hints.push(`You have a hard limit of ${queryBudget} web search queries in this run.`);
+    hints.push(
+      `You have a hard safety limit of ${queryBudget} web_search tool calls in this run. Batched query strings inside one tool call count as one call.`
+    );
     hints.push(
       "Plan before searching, reuse opened pages, and avoid minor query rewrites unless they unlock meaningfully different results."
     );
@@ -282,13 +290,16 @@ function isLikelyDocumentationQuery(query: string): boolean {
 
 export function buildCodexExecArgs(
   paths: { schemaPath: string; outputPath: string },
-  freshness: SearchFreshness
+  freshness: SearchFreshness,
+  mode: SearchMode = "fast"
 ): string[] {
   return [
     "exec",
     "--json",
     "-c",
     `web_search=\"${freshness}\"`,
+    "-c",
+    `model_reasoning_effort=\"${mode === "fast" ? "low" : "medium"}\"`,
     "--skip-git-repo-check",
     "--sandbox",
     "read-only",
@@ -353,7 +364,6 @@ export async function executeCodexWebSearch(
   const runner = options.runner ?? runCodexCommand;
   const settings = options.settings ?? DEFAULT_WEB_SEARCH_SETTINGS;
   const resolvedInput = resolveWebSearchInput(input, settings);
-  const allowFastAutoEscalation = canAutoEscalateDefaultFastSearch(input, resolvedInput);
 
   const directUrl = shouldUseDefuddleForDirectUrl(settings)
     ? getDirectUrlQuery(resolvedInput.query)
@@ -402,14 +412,7 @@ export async function executeCodexWebSearch(
   }
 
   try {
-    return await runResolvedCodexWebSearch(
-      resolvedInput,
-      options,
-      settings,
-      runner,
-      undefined,
-      allowFastAutoEscalation
-    );
+    return await runResolvedCodexWebSearch(resolvedInput, options, settings, runner);
   } catch (error) {
     const failure = getCodexFailure(error);
     const progress = getFailureProgress(error, resolvedInput);
@@ -501,24 +504,12 @@ export async function executeCodexWebSearch(
   }
 }
 
-function canAutoEscalateDefaultFastSearch(
-  originalInput: WebSearchInput,
-  resolvedInput: ResolvedWebSearchInput
-): boolean {
-  if (resolvedInput.mode !== "fast") {
-    return false;
-  }
-
-  return originalInput.mode === undefined && originalInput.freshness === undefined;
-}
-
 async function runResolvedCodexWebSearch(
   input: ResolvedWebSearchInput,
   options: ExecuteCodexWebSearchOptions,
   settings: WebSearchSettings,
   runner: RunCodexCommand,
-  retry: RetryProvenance | undefined = undefined,
-  allowFastAutoEscalation = false
+  retry: RetryProvenance | undefined = undefined
 ): Promise<{
   content: { type: "text"; text: string }[];
   details: CodexWebSearchDetails;
@@ -545,24 +536,40 @@ async function runResolvedCodexWebSearch(
   const abortController = new AbortController();
   const signal = mergeAbortSignals(options.signal, abortController);
   const heartbeatId = setInterval(() => {
-    if (!signal.aborted) {
-      emitProgressUpdate(options, progress, buildHeartbeatStatus(progress, policy.timeoutMs));
+    if (signal.aborted) {
+      return;
     }
+
+    const inactivityFailure = getInactivityFailure(progress, policy.timeoutMs);
+    if (inactivityFailure) {
+      abortController.abort(new Error(inactivityFailure));
+      return;
+    }
+
+    emitProgressUpdate(options, progress, buildHeartbeatStatus(progress, policy.timeoutMs));
   }, 8_000);
   heartbeatId.unref?.();
 
   try {
     const runnerOptions: RunCodexCommandOptions = {
-      args: buildCodexExecArgs({ schemaPath: SEARCH_OUTPUT_SCHEMA_PATH, outputPath }, freshness),
+      args: buildCodexExecArgs(
+        { schemaPath: SEARCH_OUTPUT_SCHEMA_PATH, outputPath },
+        freshness,
+        mode
+      ),
       cwd: options.cwd,
       stdin: buildCodexPrompt({ query, maxSources, mode }, { queryBudget: policy.queryBudget }),
       timeoutMs: policy.timeoutMs,
       signal,
       onStdoutLine: (line) => {
-        const previousSearchCount = progress.searchCount;
+        const previousSearchCallCount = progress.searchCallCount;
         const updates = collectProgressUpdates(progress, line);
         for (const addedQuery of updates.queries) {
-          emitProgressUpdate(options, progress, `Search #${progress.searchCount}: ${addedQuery}`);
+          emitProgressUpdate(
+            options,
+            progress,
+            `Search #${addedQuery.searchNumber}: ${addedQuery.query}`
+          );
         }
         for (const pageAction of updates.pageActions) {
           emitProgressUpdate(options, progress, pageAction);
@@ -573,42 +580,30 @@ async function runResolvedCodexWebSearch(
 
         if (
           mode === "fast" &&
-          previousSearchCount < policy.queryBudget &&
-          progress.searchCount >= policy.queryBudget &&
+          previousSearchCallCount < policy.queryBudget &&
+          progress.searchCallCount >= policy.queryBudget &&
           !warnedAtFastBudget
         ) {
           warnedAtFastBudget = true;
           emitProgressUpdate(
             options,
             progress,
-            buildFastBudgetWarning(
-              progress.searchCount,
-              policy.queryBudget,
-              allowFastAutoEscalation
-            )
+            buildFastBudgetWarning(progress.searchCallCount, policy.queryBudget)
           );
         }
 
-        if (progress.searchCount > policy.queryBudget && !abortController.signal.aborted) {
+        if (progress.searchCallCount > policy.queryBudget && !abortController.signal.aborted) {
           if (mode === "fast") {
-            if (!allowFastAutoEscalation) {
-              markFastModeExhausted(options.turnState);
-            }
+            markFastModeExhausted(options.turnState);
             abortController.abort(
-              new Error(
-                buildFastBudgetFailure(
-                  progress.searchCount,
-                  policy.queryBudget,
-                  allowFastAutoEscalation
-                )
-              )
+              new Error(buildFastBudgetFailure(progress.searchCallCount, policy.queryBudget))
             );
             return;
           }
 
           abortController.abort(
             new Error(
-              `Codex exceeded the deep search budget (${progress.searchCount}/${policy.queryBudget} queries). Narrow the request or make the query more specific.`
+              `Codex exceeded the deep search budget (${progress.searchCallCount}/${policy.queryBudget} web_search calls). Narrow the request or make the query more specific.`
             )
           );
         }
@@ -627,7 +622,7 @@ async function runResolvedCodexWebSearch(
       runResult = await runner(runnerOptions);
     } catch (error) {
       const failure = getCodexFailure(error);
-      if (mode === "fast" && !allowFastAutoEscalation && shouldExhaustFastModeInTurn(failure)) {
+      if (mode === "fast" && shouldExhaustFastModeInTurn(failure)) {
         markFastModeExhausted(options.turnState);
       }
       throw asError(failure, progress);
@@ -635,7 +630,7 @@ async function runResolvedCodexWebSearch(
 
     if (runResult.code !== 0) {
       const failure = buildCodexFailure(runResult);
-      if (mode === "fast" && !allowFastAutoEscalation && shouldExhaustFastModeInTurn(failure)) {
+      if (mode === "fast" && shouldExhaustFastModeInTurn(failure)) {
         markFastModeExhausted(options.turnState);
       }
       throw asError(failure, progress);
@@ -646,7 +641,7 @@ async function runResolvedCodexWebSearch(
       rawOutput = await readFinalCodexOutput(outputPath, runResult.stdout);
     } catch (error) {
       const failure = getCodexFailure(error);
-      if (mode === "fast" && !allowFastAutoEscalation && shouldExhaustFastModeInTurn(failure)) {
+      if (mode === "fast" && shouldExhaustFastModeInTurn(failure)) {
         markFastModeExhausted(options.turnState);
       }
       throw asError(failure, progress);
@@ -657,7 +652,7 @@ async function runResolvedCodexWebSearch(
       parsed = parseCodexWebSearchOutput(rawOutput, maxSources);
     } catch (error) {
       const failure = getCodexFailure(error);
-      if (mode === "fast" && !allowFastAutoEscalation && shouldExhaustFastModeInTurn(failure)) {
+      if (mode === "fast" && shouldExhaustFastModeInTurn(failure)) {
         markFastModeExhausted(options.turnState);
       }
       throw asError(failure, progress);
@@ -677,6 +672,7 @@ async function runResolvedCodexWebSearch(
       mode,
       freshness,
       searchCount: progress.searchCount,
+      searchCallCount: progress.searchCallCount,
       searchQueries: [...progress.searchQueries],
       pageActions: [...(progress.pageActions ?? [])],
       statusEvents: [...progress.statusEvents],
@@ -727,6 +723,7 @@ async function buildSoftFailureResult(
     mode: input.mode,
     freshness: input.freshness,
     searchCount: progress.searchCount,
+    searchCallCount: progress.searchCallCount,
     searchQueries: [...progress.searchQueries],
     pageActions: [...(progress.pageActions ?? [])],
     statusEvents: [...progress.statusEvents],
@@ -778,34 +775,15 @@ function buildFastRetryStatus(
   freshness: SearchFreshness,
   reason: string
 ): string {
-  const action = /budget/i.test(reason)
-    ? `Auto-escalating to ${mode}/${freshness} after fast mode hit its query budget.`
-    : `Retrying as ${mode}/${freshness} after fast mode failed.`;
-  return `${action} ${reason}`;
+  return `Retrying as ${mode}/${freshness} after a transient transport failure. ${reason}`;
 }
 
-function buildFastBudgetWarning(
-  searchCount: number,
-  queryBudget: number,
-  allowFastAutoEscalation: boolean
-): string {
-  if (allowFastAutoEscalation) {
-    return `Fast mode has used its full query budget (${searchCount}/${queryBudget}). If Codex needs another search, it will auto-escalate once to deep/live.`;
-  }
-
-  return `Fast mode has used its full query budget (${searchCount}/${queryBudget}). If Codex needs another search, this run will fail. Rerun with mode=deep or freshness=live for a broader search.`;
+function buildFastBudgetWarning(searchCallCount: number, queryBudget: number): string {
+  return `Fast mode has used its full search-call budget (${searchCallCount}/${queryBudget}). If Codex makes another search call, this run will fail. Rerun with mode=deep for broader research.`;
 }
 
-function buildFastBudgetFailure(
-  searchCount: number,
-  queryBudget: number,
-  allowFastAutoEscalation: boolean
-): string {
-  if (allowFastAutoEscalation) {
-    return `Fast mode exhausted its query budget (${searchCount}/${queryBudget} queries). Auto-escalating once to deep/live.`;
-  }
-
-  return `Codex exceeded the fast search budget (${searchCount}/${queryBudget} queries). Do not retry fast mode again in this turn; rerun with mode=deep or freshness=live if you need broader or fresher results.`;
+function buildFastBudgetFailure(searchCallCount: number, queryBudget: number): string {
+  return `Codex exceeded the fast search-call budget (${searchCallCount}/${queryBudget} calls). Do not retry fast mode again in this turn; rerun with mode=deep if you need broader research.`;
 }
 
 async function maybeRunDefuddleSearch(
@@ -876,18 +854,23 @@ async function maybeRunDefuddleSearch(
     snippet: buildDefuddleSnippet(result),
   }));
   const summary = buildDefuddleSummary(results, defuddle);
-  const directContent = defuddle.directUrlQuery
+  // Direct URL requests get the full extracted content (renderToolResult
+  // truncates to Pi's limits with a full-output temp file). Fallback runs
+  // include a bounded excerpt so "summarize <url>" style requests still
+  // receive usable material instead of just a title and snippet.
+  const extractedContent = defuddle.directUrlQuery
     ? `\n\nExtracted content:\n${results[0]?.content.trim() ?? ""}`
-    : "";
+    : buildFallbackContentExcerpt(results);
   updateProgressElapsed(progress);
   const renderedResult = await renderToolResult(
-    `${formatWebSearchResult({ summary, sources })}${directContent}`
+    `${formatWebSearchResult({ summary, sources })}${extractedContent}`
   );
   const details: CodexWebSearchDetails = {
     query: input.query,
     mode: input.mode,
     freshness: input.freshness,
     searchCount: progress.searchCount,
+    searchCallCount: progress.searchCallCount,
     searchQueries: [...progress.searchQueries],
     pageActions: [...(progress.pageActions ?? [])],
     statusEvents: [...progress.statusEvents],
@@ -919,6 +902,23 @@ async function maybeRunDefuddleSearch(
     content: [{ type: "text", text: renderedResult.text }],
     details,
   };
+}
+
+const MAX_FALLBACK_CONTENT_CHARS = 12_000;
+
+function buildFallbackContentExcerpt(results: DefuddleParseResult[]): string {
+  const first = results[0];
+  const content = first?.content.trim();
+  if (!first || !content) {
+    return "";
+  }
+
+  const excerpt =
+    content.length > MAX_FALLBACK_CONTENT_CHARS
+      ? `${content.slice(0, MAX_FALLBACK_CONTENT_CHARS).trimEnd()}\n\n[Content truncated to ${MAX_FALLBACK_CONTENT_CHARS} characters.]`
+      : content;
+
+  return `\n\nExtracted content from ${first.url}:\n${excerpt}`;
 }
 
 async function readFinalCodexOutput(outputPath: string, stdout: string): Promise<string> {
@@ -1107,7 +1107,10 @@ function shouldRetryWithDeepLiveSearch(
     return false;
   }
 
-  return failure.recoverable;
+  // Only genuine transient failures earn a deep/live retry. Timeouts and
+  // budget exhaustion mean the fast attempt already consumed real time; a
+  // heavier retry would multiply the total latency rather than recover it.
+  return failure.kind === "transport";
 }
 
 function createCodexFailure(
@@ -1209,7 +1212,7 @@ function classifyFailureText(message: string): CodexFailureDetails {
     return createCodexFailure("timeout", message, true);
   }
 
-  if (/query budget|search budget|failed earlier in this turn/i.test(message)) {
+  if (/query budget|search(?:-call)? budget|failed earlier in this turn/i.test(message)) {
     return createCodexFailure("budget", message, true);
   }
 
@@ -1289,11 +1292,13 @@ function createSearchProgress(
     mode,
     freshness,
     searchCount: 0,
+    searchCallCount: 0,
     searchQueries: [],
     pageActions: [],
     statusEvents: [],
     eventCount: 0,
     startedAt: Date.now(),
+    searchCallIds: [],
   };
 }
 
@@ -1305,6 +1310,7 @@ function cloneProgress(progress: WebSearchProgressDetails): WebSearchProgressDet
     mode: progress.mode,
     freshness: progress.freshness,
     searchCount: progress.searchCount,
+    searchCallCount: progress.searchCallCount,
     searchQueries: [...progress.searchQueries],
     pageActions: [...(progress.pageActions ?? [])],
     statusEvents: [...progress.statusEvents],
@@ -1337,11 +1343,47 @@ function updateProgressElapsed(progress: WebSearchProgressDetails): void {
 function buildHeartbeatStatus(progress: WebSearchProgressDetails, timeoutMs: number): string {
   const elapsed = formatElapsed(progress.elapsedMs ?? 0);
   const budget = progress.queryBudget
-    ? ` · ${progress.searchCount}/${progress.queryBudget} searches`
+    ? ` · ${progress.searchCallCount}/${progress.queryBudget} search calls · ${progress.searchCount} queries`
     : "";
   const phase =
-    progress.searchCount > 0 ? "researching and inspecting pages" : "waiting for search activity";
-  return `Still ${phase} · ${elapsed}${budget} (timeout ${formatElapsed(timeoutMs)})`;
+    progress.searchCallCount > 0
+      ? "researching and inspecting pages"
+      : "waiting for search activity";
+  const idle =
+    progress.lastEventAt !== undefined
+      ? ` · last event ${formatElapsed(Date.now() - progress.lastEventAt)} ago`
+      : "";
+  return `Still ${phase} · ${elapsed}${budget}${idle} (timeout ${formatElapsed(timeoutMs)})`;
+}
+
+/**
+ * Phase-aware inactivity deadlines: a run that never produces JSONL events is
+ * a dead connection and should fail well before the wall-clock timeout; a run
+ * that goes silent mid-stream has stalled. Both classify as recoverable
+ * timeouts so the usual failure handling applies.
+ */
+export function getInactivityFailure(
+  progress: WebSearchProgressDetails,
+  timeoutMs: number
+): string | undefined {
+  const now = Date.now();
+  const startedAt = progress.startedAt ?? now;
+
+  if ((progress.eventCount ?? 0) === 0) {
+    const startupLimit = Math.min(STARTUP_INACTIVITY_TIMEOUT_MS, timeoutMs);
+    if (now - startedAt > startupLimit) {
+      return `Codex web search timed out: no backend events within ${formatElapsed(startupLimit)}. The Codex connection appears dead; check network access and \`codex login status\`.`;
+    }
+    return undefined;
+  }
+
+  const lastEventAt = progress.lastEventAt ?? startedAt;
+  const stallLimit = Math.min(STALL_INACTIVITY_TIMEOUT_MS, timeoutMs);
+  if (now - lastEventAt > stallLimit) {
+    return `Codex web search timed out: no backend events for ${formatElapsed(now - lastEventAt)} after activity started. The run appears stalled.`;
+  }
+
+  return undefined;
 }
 
 function formatElapsed(milliseconds: number): string {
@@ -1389,14 +1431,18 @@ function mergeAbortSignals(
 function collectProgressUpdates(
   progress: WebSearchProgressDetails,
   line: string
-): { queries: string[]; pageActions: string[]; statuses: string[] } {
+): {
+  queries: { query: string; searchNumber: number }[];
+  pageActions: string[];
+  statuses: string[];
+} {
   const event = parseJsonObject(line);
-  if (event) {
-    progress.eventCount = (progress.eventCount ?? 0) + 1;
-  }
   if (!event) {
     return { queries: [], pageActions: [], statuses: [] };
   }
+
+  progress.eventCount = (progress.eventCount ?? 0) + 1;
+  progress.lastEventAt = Date.now();
 
   const queries = collectSearchQueries(progress, event);
   const pageActions = collectPageActions(progress, event);
@@ -1407,11 +1453,12 @@ function collectProgressUpdates(
 function collectSearchQueries(
   progress: WebSearchProgressDetails,
   event: Record<string, unknown>
-): string[] {
+): { query: string; searchNumber: number }[] {
   const queries = extractSearchQueries(event);
   if (queries.length === 0) return [];
 
-  const addedQueries: string[] = [];
+  recordSearchCall(progress, event);
+  const addedQueries: { query: string; searchNumber: number }[] = [];
   for (const query of queries) {
     const normalized = query.trim();
     if (!normalized) continue;
@@ -1424,10 +1471,28 @@ function collectSearchQueries(
     }
 
     progress.searchQueries.push(normalized);
-    addedQueries.push(normalized);
+    addedQueries.push({ query: normalized, searchNumber: progress.searchCount });
   }
 
   return addedQueries;
+}
+
+function recordSearchCall(
+  progress: WebSearchProgressDetails,
+  event: Record<string, unknown>
+): void {
+  const item = extractEventItem(event);
+  const itemId = typeof item?.id === "string" ? item.id : undefined;
+  const recordedIds = progress.searchCallIds ?? (progress.searchCallIds = []);
+
+  if (itemId) {
+    if (recordedIds.includes(itemId)) {
+      return;
+    }
+    recordedIds.push(itemId);
+  }
+
+  progress.searchCallCount += 1;
 }
 
 function collectPageActions(
@@ -1638,15 +1703,26 @@ function extractSearchQueries(event: Record<string, unknown>): string[] {
     return [];
   }
 
-  const queries = [
-    ...(shouldTreatTopLevelQueriesAsSearch(typedItem)
-      ? [...extractQueryValues(typedItem.queries), ...extractQueryValues(typedItem.query)]
-      : []),
+  const actionQueries = dedupeStrings([
     ...extractSearchActionQueries(typedItem.action),
     ...extractSearchActionQueries(typedItem.output),
-  ];
+  ]);
 
-  return dedupeStrings(queries);
+  // Current Codex events include a human-readable top-level `query` such as
+  // "first query ..." alongside the complete batched action queries. Counting
+  // both double-counts every search call and can trip the budget before Codex
+  // gets a chance to synthesize its answer. Use the display query only as a
+  // compatibility fallback for event shapes without action query data.
+  if (actionQueries.length > 0) {
+    return actionQueries;
+  }
+
+  return shouldTreatTopLevelQueriesAsSearch(typedItem)
+    ? dedupeStrings([
+        ...extractQueryValues(typedItem.queries),
+        ...extractQueryValues(typedItem.query),
+      ])
+    : [];
 }
 
 function extractPageActions(event: Record<string, unknown>): string[] {

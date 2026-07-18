@@ -7,6 +7,12 @@ export const MAX_ALLOWED_SOURCES = 10;
 
 export const FAST_SEARCH_TIMEOUT_MS = 90_000;
 export const DEEP_SEARCH_TIMEOUT_MS = 240_000;
+
+// Phase-aware inactivity deadlines, checked alongside the hard wall-clock
+// timeout. A run that emits no JSONL events at all is a dead connection and
+// should fail fast; a run that goes silent mid-research has stalled.
+export const STARTUP_INACTIVITY_TIMEOUT_MS = 30_000;
+export const STALL_INACTIVITY_TIMEOUT_MS = 60_000;
 export const DEFUDDLE_TIMEOUT_MS = 45_000;
 export const MIN_TIMEOUT_MS = 5_000;
 export const MAX_TIMEOUT_MS = 600_000;

@@ -1,0 +1,9 @@
+{"type":"thread.started","thread_id":"019f72a6-6ad3-7c91-95f7-f9f51adec732"}
+{"type":"turn.started"}
+{"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"I’ll verify the defaults from primary OpenJDK documentation, using one batched search call and then opening a result."}}
+{"type":"item.started","item":{"id":"item_1","type":"web_search","id":"exec-fee36254-8408-4aa8-b371-1c2aef987713","query":"","action":{"type":"other"}}}
+{"type":"item.completed","item":{"id":"item_1","type":"web_search","id":"exec-fee36254-8408-4aa8-b371-1c2aef987713","query":"site:docs.oracle.com/en/java/javase/21/gctuning default collector G1 ...","action":{"type":"search","queries":["site:docs.oracle.com/en/java/javase/21/gctuning default collector G1","site:docs.oracle.com/javase/8/docs/technotes/guides/vm/gctuning default collector parallel","site:openjdk.org JDK 9 G1 default garbage collector JEP 248"]}}}
+{"type":"item.started","item":{"id":"item_2","type":"web_search","id":"exec-1c73dabf-55e6-43e1-9dec-ad9f189045ff","query":"","action":{"type":"other"}}}
+{"type":"item.completed","item":{"id":"item_2","type":"web_search","id":"exec-1c73dabf-55e6-43e1-9dec-ad9f189045ff","query":"","action":{"type":"other"}}}
+{"type":"item.completed","item":{"id":"item_3","type":"agent_message","text":"OpenJDK 21 defaults to G1 GC, which prioritizes shorter, more predictable pauses while retaining good throughput ([JDK 21 GC guide](https://docs.oracle.com/en/java/javase/21/gctuning/hotspot-virtual-machine-garbage-collection-tuning-guide.pdf)). OpenJDK 8 defaults to Parallel GC on server-class machines, favoring maximum throughput—though JVM ergonomics may select Serial GC on constrained configurations ([JDK 8 GC guide](https://docs.oracle.com/javase/8/docs/technotes/guides/vm/gctuning/parallel.html))."}}
+{"type":"turn.completed","usage":{"input_tokens":58988,"cached_input_tokens":42240,"output_tokens":412,"reasoning_output_tokens":90}}

@@ -8,6 +8,7 @@ import {
   buildCodexPrompt,
   executeCodexWebSearch,
   formatWebSearchResult,
+  getInactivityFailure,
   isLiveFreshnessQuery,
   normalizeMaxSources,
   normalizeQuery,
@@ -15,7 +16,13 @@ import {
   resolveSearchFreshness,
   resolveSearchMode,
 } from "../src/codex.js";
-import { findBundledCodexExecutable } from "../src/codex-command.js";
+import {
+  appendBounded,
+  findBundledCodexExecutable,
+  MAX_CAPTURED_STDERR_BYTES,
+  MAX_CAPTURED_STDOUT_BYTES,
+  runCodexCommand,
+} from "../src/codex-command.js";
 import { extractUrlsFromText, getDirectUrlQuery } from "../src/defuddle.js";
 import { DEFAULT_FAST_MAX_SOURCES, MAX_ALLOWED_SOURCES } from "../src/constants.js";
 import { DEFAULT_WEB_SEARCH_SETTINGS } from "../src/settings.js";
@@ -136,6 +143,8 @@ void test("buildCodexPrompt produces a JSON-only research prompt", () => {
   assert.match(fastPrompt, /at most 3 items/i);
   assert.match(fastPrompt, /User query: latest codex cli release/);
   assert.match(fastPrompt, /quick lookup/i);
+  assert.match(fastPrompt, /exactly one web_search tool call/i);
+  assert.match(fastPrompt, /answer immediately from the best evidence/i);
   assert.match(
     defaultFastPrompt,
     new RegExp(`at most ${DEFAULT_WEB_SEARCH_SETTINGS.fastMaxSources} items`, "i")
@@ -145,7 +154,7 @@ void test("buildCodexPrompt produces a JSON-only research prompt", () => {
     new RegExp(`at most ${DEFAULT_WEB_SEARCH_SETTINGS.deepMaxSources} items`, "i")
   );
   assert.match(deepPrompt, /deeper research task/i);
-  assert.match(deepPrompt, /hard limit of 24 web search queries/i);
+  assert.match(deepPrompt, /hard safety limit of 24 web_search tool calls/i);
   assert.match(deepPrompt, /supplied search operators or site constraints/i);
   assert.match(deepPrompt, /documentation or reference lookup/i);
 });
@@ -164,6 +173,8 @@ void test("buildCodexExecArgs configures the requested web-search freshness", ()
     "--json",
     "-c",
     'web_search="cached"',
+    "-c",
+    'model_reasoning_effort="low"',
     "--skip-git-repo-check",
     "--sandbox",
     "read-only",
@@ -176,6 +187,113 @@ void test("buildCodexExecArgs configures the requested web-search freshness", ()
     "/tmp/output.json",
     "-",
   ]);
+
+  const deepArgs = buildCodexExecArgs(
+    { schemaPath: "/tmp/schema.json", outputPath: "/tmp/output.json" },
+    "live",
+    "deep"
+  );
+  assert.ok(deepArgs.includes('model_reasoning_effort="medium"'));
+});
+
+void test("getInactivityFailure distinguishes dead connections from mid-run stalls", () => {
+  const now = Date.now();
+  const base = {
+    query: "q",
+    mode: "fast" as const,
+    freshness: "indexed" as const,
+    searchCount: 0,
+    searchCallCount: 0,
+    searchQueries: [],
+    statusEvents: [],
+  };
+
+  // No events yet, within the startup window: no failure.
+  assert.equal(
+    getInactivityFailure({ ...base, eventCount: 0, startedAt: now - 10_000 }, 90_000),
+    undefined
+  );
+
+  // No events past the startup window: dead connection.
+  assert.match(
+    getInactivityFailure({ ...base, eventCount: 0, startedAt: now - 31_000 }, 90_000) ?? "",
+    /no backend events within 30s/
+  );
+
+  // Events flowing recently: no failure even if the run started long ago.
+  assert.equal(
+    getInactivityFailure(
+      { ...base, eventCount: 5, startedAt: now - 80_000, lastEventAt: now - 5_000 },
+      90_000
+    ),
+    undefined
+  );
+
+  // Events stopped for longer than the stall window: stalled.
+  assert.match(
+    getInactivityFailure(
+      { ...base, eventCount: 5, startedAt: now - 120_000, lastEventAt: now - 61_000 },
+      240_000
+    ) ?? "",
+    /appears stalled/
+  );
+
+  // Inactivity limits never exceed the wall-clock timeout.
+  assert.match(
+    getInactivityFailure({ ...base, eventCount: 0, startedAt: now - 6_000 }, 5_000) ?? "",
+    /no backend events within 5s/
+  );
+});
+
+void test("appendBounded keeps the tail of oversized subprocess output", () => {
+  assert.equal(appendBounded("abc", "def", 100), "abcdef");
+  assert.equal(appendBounded("abc", "def", 4), "cdef");
+  assert.equal(appendBounded("", "x".repeat(10), 4), "xxxx");
+  assert.ok(MAX_CAPTURED_STDOUT_BYTES > MAX_CAPTURED_STDERR_BYTES);
+});
+
+void test("runCodexCommand caps captured stdout while still emitting every line", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-codex-web-search-cap-"));
+  const script = join(dir, "codex");
+  // Emit ~9MB of stdout lines: beyond MAX_CAPTURED_STDOUT_BYTES (8MB).
+  await writeFile(
+    script,
+    [
+      "#!/usr/bin/env node",
+      "const line = 'y'.repeat(1024);",
+      "for (let i = 0; i < 9 * 1024; i++) process.stdout.write(line + '\\n');",
+      "process.stdout.write('FINAL-MARKER\\n');",
+    ].join("\n"),
+    { mode: 0o755 }
+  );
+
+  const previousEnv = process.env.PI_CODEX_WEB_SEARCH_CODEX_PATH;
+  process.env.PI_CODEX_WEB_SEARCH_CODEX_PATH = script;
+  try {
+    let lineCount = 0;
+    let sawFinal = false;
+    const result = await runCodexCommand({
+      args: [],
+      cwd: dir,
+      onStdoutLine: (line) => {
+        lineCount += 1;
+        if (line === "FINAL-MARKER") sawFinal = true;
+      },
+    });
+
+    assert.equal(result.code, 0);
+    assert.equal(lineCount, 9 * 1024 + 1);
+    assert.equal(sawFinal, true);
+    assert.ok(result.stdout.length <= MAX_CAPTURED_STDOUT_BYTES);
+    assert.ok(result.stdout.endsWith("FINAL-MARKER\n"));
+  } finally {
+    if (previousEnv === undefined) {
+      delete process.env.PI_CODEX_WEB_SEARCH_CODEX_PATH;
+    } else {
+      process.env.PI_CODEX_WEB_SEARCH_CODEX_PATH = previousEnv;
+    }
+    await rm(dir, { recursive: true, force: true });
+  }
 });
 
 void test("findBundledCodexExecutable locates npm-installed vendor binaries", async () => {
@@ -323,6 +441,7 @@ void test("executeCodexWebSearch returns formatted content from codex output", a
         type: "item.started",
         item: {
           type: "web_search_call",
+          query: "developers.openai.com codex cli reference ...",
           action: {
             type: "search",
             query: "developers.openai.com codex cli reference",
@@ -336,6 +455,7 @@ void test("executeCodexWebSearch returns formatted content from codex output", a
         type: "item.completed",
         item: {
           type: "web_search",
+          query: "codex exec reference official docs ...",
           action: {
             type: "search",
             query: "codex exec reference official docs",
@@ -385,6 +505,7 @@ void test("executeCodexWebSearch returns formatted content from codex output", a
   assert.equal(result.details.freshness, "indexed");
   assert.equal(result.details.sourceCount, 1);
   assert.equal(result.details.searchCount, 2);
+  assert.equal(result.details.searchCallCount, 2);
   assert.equal(result.details.queryBudget, 10);
   assert.equal(result.details.attempt, 1);
   assert.ok((result.details.elapsedMs ?? 0) >= 0);
@@ -551,18 +672,53 @@ void test("executeCodexWebSearch falls back to Defuddle for URL-based requests w
     }
   );
 
-  assert.equal(result.details.mode, "deep");
-  assert.equal(result.details.freshness, "live");
-  assert.deepEqual(result.details.retry, {
-    retriedFromFast: true,
-    originalMode: "fast",
-    originalFreshness: "indexed",
-    fallbackReason: "Codex web search timed out after 90 seconds.",
-  });
+  assert.equal(result.details.mode, "fast");
+  assert.equal(result.details.freshness, "indexed");
+  assert.equal(result.details.retry, undefined);
   assert.equal(result.details.defuddle?.directUrlQuery, false);
   assert.equal(result.details.defuddle?.reason, "Codex web search timed out after 90 seconds.");
   assert.match(result.details.summary, /Codex did not produce a usable response/);
   assert.equal(result.details.sources[0]?.url, "https://developers.openai.com/codex/cli/features");
+  assert.match(
+    result.content[0]?.text ?? "",
+    /Extracted content from https:\/\/developers\.openai\.com\/codex\/cli\/features:\nCodex supports workflows beyond chat\./
+  );
+});
+
+void test("executeCodexWebSearch bounds fallback extracted content to a readable excerpt", async () => {
+  const runner: RunCodexCommand = () =>
+    Promise.reject(new Error("Codex web search timed out after 90 seconds."));
+
+  const hugeContent = "lorem ipsum ".repeat(5_000);
+  const defuddleRunner: RunDefuddleCommand = ({ url }) =>
+    Promise.resolve({
+      url,
+      title: "Huge page",
+      description: "",
+      domain: "example.com",
+      author: "",
+      published: "",
+      wordCount: 10_000,
+      content: hugeContent,
+    });
+
+  const result = await executeCodexWebSearch(
+    { query: "summarize https://example.com/huge-page" },
+    {
+      cwd: process.cwd(),
+      runner,
+      defuddleRunner,
+      settings: {
+        ...DEFAULT_WEB_SEARCH_SETTINGS,
+        defuddleMode: "both",
+      },
+    }
+  );
+
+  const text = result.content[0]?.text ?? "";
+  assert.match(text, /Extracted content from https:\/\/example\.com\/huge-page:/);
+  assert.match(text, /\[Content truncated to 12000 characters\.\]/);
+  assert.ok(text.length < hugeContent.length);
 });
 
 void test("executeCodexWebSearch preserves Codex progress when Defuddle handles a failed run", async () => {
@@ -674,15 +830,10 @@ void test("executeCodexWebSearch does not use Defuddle fallback for generic URL 
   );
 
   assert.equal(defuddleInvoked, false);
-  assert.equal(result.details.mode, "deep");
-  assert.equal(result.details.freshness, "live");
+  assert.equal(result.details.mode, "fast");
+  assert.equal(result.details.freshness, "indexed");
   assert.equal(result.details.failure?.kind, "timeout");
-  assert.deepEqual(result.details.retry, {
-    retriedFromFast: true,
-    originalMode: "fast",
-    originalFreshness: "indexed",
-    fallbackReason: "Codex web search timed out after 90 seconds.",
-  });
+  assert.equal(result.details.retry, undefined);
   assert.match(result.content[0]?.text ?? "", /could not produce a usable result/i);
 });
 
@@ -934,14 +1085,16 @@ void test("executeCodexWebSearch honors explicit freshness overrides", async () 
   assert.equal(result.details.freshness, "cached");
 });
 
-void test("executeCodexWebSearch retries default fast searches as deep/live after retryable failures", async () => {
+void test("executeCodexWebSearch retries default fast searches as deep/live after transport failures", async () => {
   const attempts: { args: string[]; stdin: string | undefined }[] = [];
 
   const runner: RunCodexCommand = ({ args, stdin }) => {
     attempts.push({ args, stdin });
 
     if (attempts.length === 1) {
-      return Promise.reject(new Error("Codex web search timed out after 90 seconds."));
+      return Promise.reject(
+        new Error("stream disconnected before completion: error sending request")
+      );
     }
 
     const outputPath = args[args.indexOf("--output-last-message") + 1];
@@ -974,9 +1127,34 @@ void test("executeCodexWebSearch retries default fast searches as deep/live afte
     retriedFromFast: true,
     originalMode: "fast",
     originalFreshness: "indexed",
-    fallbackReason: "Codex web search timed out after 90 seconds.",
+    fallbackReason: "stream disconnected before completion: error sending request",
   });
   assert.match(result.content[0]?.text ?? "", /Recovered on deep\/live retry\./);
+});
+
+void test("executeCodexWebSearch does not retry fast timeouts as deep/live", async () => {
+  const turnState = { fastModeExhausted: false };
+  let attempts = 0;
+
+  const runner: RunCodexCommand = () => {
+    attempts += 1;
+    return Promise.reject(new Error("Codex web search timed out after 90 seconds."));
+  };
+
+  const result = await executeCodexWebSearch(
+    { query: "simple lookup that times out" },
+    {
+      cwd: process.cwd(),
+      runner,
+      turnState,
+    }
+  );
+
+  assert.equal(attempts, 1);
+  assert.equal(result.details.mode, "fast");
+  assert.equal(result.details.failure?.kind, "timeout");
+  assert.equal(result.details.retry, undefined);
+  assert.equal(turnState.fastModeExhausted, true);
 });
 
 void test("executeCodexWebSearch keeps retry provenance when Defuddle handles a failed deep/live retry", async () => {
@@ -986,7 +1164,9 @@ void test("executeCodexWebSearch keeps retry provenance when Defuddle handles a 
     attempts += 1;
 
     if (attempts === 1) {
-      return Promise.reject(new Error("Codex web search timed out after 90 seconds."));
+      return Promise.reject(
+        new Error("stream disconnected before completion: error sending request")
+      );
     }
 
     return Promise.reject(
@@ -1028,7 +1208,7 @@ void test("executeCodexWebSearch keeps retry provenance when Defuddle handles a 
     retriedFromFast: true,
     originalMode: "fast",
     originalFreshness: "indexed",
-    fallbackReason: "Codex web search timed out after 90 seconds.",
+    fallbackReason: "stream disconnected before completion: error sending request",
   });
   assert.equal(
     result.details.defuddle?.reason,
@@ -1036,48 +1216,37 @@ void test("executeCodexWebSearch keeps retry provenance when Defuddle handles a 
   );
 });
 
-void test("executeCodexWebSearch auto-escalates default fast searches after budget exhaustion", async () => {
+void test("executeCodexWebSearch soft-fails default fast searches after budget exhaustion without escalating", async () => {
   const statusTexts: string[] = [];
+  const turnState = { fastModeExhausted: false };
   let attempts = 0;
 
-  const runner: RunCodexCommand = ({ args, onStdoutLine, signal }) => {
+  const runner: RunCodexCommand = ({ onStdoutLine, signal }) => {
     attempts += 1;
 
-    if (attempts === 1) {
-      for (let i = 1; i <= 11; i += 1) {
-        onStdoutLine?.(
-          JSON.stringify({
-            type: "item.completed",
-            item: {
-              type: "web_search",
-              action: {
-                type: "search",
-                query: `query ${i}`,
-                queries: [`query ${i}`],
-              },
+    for (let i = 1; i <= 11; i += 1) {
+      onStdoutLine?.(
+        JSON.stringify({
+          type: "item.completed",
+          item: {
+            type: "web_search",
+            action: {
+              type: "search",
+              query: `query ${i}`,
+              queries: [`query ${i}`],
             },
-          })
-        );
-        if (signal?.aborted) break;
-      }
-
-      const reason: unknown = signal?.reason;
-      return Promise.reject(
-        reason instanceof Error
-          ? reason
-          : new Error(typeof reason === "string" ? reason : "expected abort")
+          },
+        })
       );
+      if (signal?.aborted) break;
     }
 
-    const outputPath = args[args.indexOf("--output-last-message") + 1];
-    assert.ok(outputPath);
-    return writeFile(
-      outputPath,
-      JSON.stringify({
-        summary: "Recovered after fast-mode budget exhaustion.",
-        sources: [],
-      })
-    ).then(() => ({ code: 0, stdout: "", stderr: "" }));
+    const reason: unknown = signal?.reason;
+    return Promise.reject(
+      reason instanceof Error
+        ? reason
+        : new Error(typeof reason === "string" ? reason : "expected abort")
+    );
   };
 
   const result = await executeCodexWebSearch(
@@ -1085,6 +1254,7 @@ void test("executeCodexWebSearch auto-escalates default fast searches after budg
     {
       cwd: process.cwd(),
       runner,
+      turnState,
       onUpdate: (update) => {
         const details = update.details as { statusText?: string } | undefined;
         statusTexts.push(details?.statusText ?? "");
@@ -1092,19 +1262,17 @@ void test("executeCodexWebSearch auto-escalates default fast searches after budg
     }
   );
 
-  assert.equal(attempts, 2);
-  assert.equal(result.details.mode, "deep");
-  assert.equal(result.details.freshness, "live");
-  assert.match(result.details.retry?.fallbackReason ?? "", /Auto-escalating once to deep\/live/);
-  assert.ok(
-    statusTexts.some((line) => line.includes("Fast mode has used its full query budget (10/10)"))
-  );
+  assert.equal(attempts, 1);
+  assert.equal(result.details.mode, "fast");
+  assert.equal(result.details.failure?.kind, "budget");
+  assert.equal(result.details.retry, undefined);
+  assert.equal(turnState.fastModeExhausted, true);
   assert.ok(
     statusTexts.some((line) =>
-      line.includes("Auto-escalating to deep/live after fast mode hit its query budget")
+      line.includes("Fast mode has used its full search-call budget (10/10)")
     )
   );
-  assert.match(result.content[0]?.text ?? "", /Recovered after fast-mode budget exhaustion\./);
+  assert.match(result.content[0]?.text ?? "", /fast search-call budget/);
 });
 
 void test("executeCodexWebSearch rejects blank queries before spawning Codex", async () => {
@@ -1156,6 +1324,51 @@ void test("executeCodexWebSearch truncates oversized tool output and keeps a tem
   if (result.details.fullOutputPath) {
     await rm(dirname(result.details.fullOutputPath), { recursive: true, force: true });
   }
+});
+
+void test("executeCodexWebSearch budgets batched queries by web_search call", async () => {
+  const runner: RunCodexCommand = ({ args, onStdoutLine, signal }) => {
+    const batches = [
+      ["query 1", "query 2", "query 3", "query 4"],
+      ["query 5", "query 6", "query 7", "query 8", "query 9", "query 10", "query 11", "query 12"],
+    ];
+
+    for (const [index, queries] of batches.entries()) {
+      onStdoutLine?.(
+        JSON.stringify({
+          type: "item.completed",
+          item: {
+            id: `web-search-${index + 1}`,
+            type: "web_search",
+            query: `${queries[0]} ...`,
+            action: { type: "search", queries },
+          },
+        })
+      );
+    }
+
+    assert.equal(signal?.aborted, false);
+    const outputPath = args[args.indexOf("--output-last-message") + 1];
+    assert.ok(outputPath);
+    return writeFile(
+      outputPath,
+      JSON.stringify({ summary: "Completed two batched search calls.", sources: [] })
+    ).then(() => ({ code: 0, stdout: "", stderr: "" }));
+  };
+
+  const result = await executeCodexWebSearch(
+    { query: "batched technical lookup", mode: "fast" },
+    { cwd: process.cwd(), runner }
+  );
+
+  assert.equal(result.details.failure, undefined);
+  assert.equal(result.details.searchCallCount, 2);
+  assert.equal(result.details.searchCount, 12);
+  assert.equal(
+    result.details.searchQueries.some((query) => query.endsWith("...")),
+    false
+  );
+  assert.match(result.content[0]?.text ?? "", /Completed two batched search calls/);
 });
 
 void test("executeCodexWebSearch allows runs that use the full fast search budget", async () => {
@@ -1537,7 +1750,7 @@ void test("executeCodexWebSearch counts repeated identical searches against the 
   assert.equal(result.details.failure?.kind, "budget");
   assert.equal(result.details.searchCount, 11);
   assert.deepEqual(result.details.searchQueries, ["same query"]);
-  assert.match(result.content[0]?.text ?? "", /11\/10 queries/);
+  assert.match(result.content[0]?.text ?? "", /11\/10 calls/);
 });
 
 void test("executeCodexWebSearch soft-fails explicit fast mode when Codex exceeds the search budget", async () => {
@@ -1577,7 +1790,7 @@ void test("executeCodexWebSearch soft-fails explicit fast mode when Codex exceed
 
   assert.equal(result.details.failure?.kind, "budget");
   assert.equal(result.details.searchCount, 11);
-  assert.match(result.content[0]?.text ?? "", /fast search budget/);
+  assert.match(result.content[0]?.text ?? "", /fast search-call budget/);
 });
 
 void test("executeCodexWebSearch soft-fails repeated fast retries within the same turn", async () => {
@@ -1732,65 +1945,13 @@ void test("executeCodexWebSearch does not poison later fast searches after a rec
   assert.match(second.content[0]?.text ?? "", /Later fast search still works\./);
 });
 
-void test("executeCodexWebSearch does not poison later fast searches after a recovered timeout", async () => {
-  const turnState = { fastModeExhausted: false };
-  let attempts = 0;
-
-  const runner: RunCodexCommand = ({ args }) => {
-    attempts += 1;
-
-    if (attempts === 1) {
-      return Promise.reject(new Error("Codex web search timed out after 90 seconds."));
-    }
-
-    const outputPath = args[args.indexOf("--output-last-message") + 1];
-    assert.ok(outputPath);
-    const summary =
-      attempts === 2
-        ? "Recovered after timeout retry."
-        : "Later fast search still works after timeout.";
-    return writeFile(outputPath, JSON.stringify({ summary, sources: [] })).then(() => ({
-      code: 0,
-      stdout: "",
-      stderr: "",
-    }));
-  };
-
-  const first = await executeCodexWebSearch(
-    { query: "first timeout" },
-    {
-      cwd: process.cwd(),
-      runner,
-      turnState,
-    }
-  );
-  const second = await executeCodexWebSearch(
-    { query: "second fast lookup", mode: "fast" },
-    {
-      cwd: process.cwd(),
-      runner,
-      turnState,
-    }
-  );
-
-  assert.equal(first.details.mode, "deep");
-  assert.equal(turnState.fastModeExhausted, false);
-  assert.equal(second.details.mode, "fast");
-  assert.match(second.content[0]?.text ?? "", /Later fast search still works after timeout\./);
-});
-
-void test("executeCodexWebSearch blocks later fast searches after an unrecovered timeout", async () => {
+void test("executeCodexWebSearch blocks later fast searches after a timeout", async () => {
   const turnState = { fastModeExhausted: false };
   let attempts = 0;
 
   const runner: RunCodexCommand = () => {
     attempts += 1;
-
-    if (attempts === 1) {
-      return Promise.reject(new Error("Codex web search timed out after 90 seconds."));
-    }
-
-    return Promise.reject(new Error("Codex still timed out after retry."));
+    return Promise.reject(new Error("Codex web search timed out after 90 seconds."));
   };
 
   const first = await executeCodexWebSearch(
@@ -1813,7 +1974,7 @@ void test("executeCodexWebSearch blocks later fast searches after an unrecovered
   assert.equal(first.details.failure?.kind, "timeout");
   assert.equal(turnState.fastModeExhausted, true);
   assert.equal(second.details.failure?.kind, "budget");
-  assert.equal(attempts, 2);
+  assert.equal(attempts, 1);
 });
 
 void test("executeCodexWebSearch classifies common backend 5xx failures as transport", async () => {

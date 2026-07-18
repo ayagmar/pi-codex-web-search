@@ -1,12 +1,16 @@
 import { spawn } from "node:child_process";
 import { createRequire } from "node:module";
 import { dirname, join } from "node:path";
+import { appendBounded } from "./codex-command.js";
 import { DEFUDDLE_TIMEOUT_MS } from "./constants.js";
 import type { DefuddleParseResult, RunDefuddleCommandOptions } from "./types.js";
 
 const require = createRequire(import.meta.url);
 const DEFUDDLE_URL_PREFIX = "https://defuddle.md/";
 const URL_PATTERN = /https?:\/\/\S+/giu;
+// Extracted page content is bounded before it reaches result rendering.
+const MAX_DEFUDDLE_STDOUT_BYTES = 4 * 1024 * 1024;
+const MAX_DEFUDDLE_STDERR_BYTES = 256 * 1024;
 
 interface DefuddleCliOutput {
   content?: unknown;
@@ -159,12 +163,12 @@ export async function runDefuddleCommand(
 
     child.stdout.setEncoding("utf-8");
     child.stdout.on("data", (chunk: string) => {
-      stdout += chunk;
+      stdout = appendBounded(stdout, chunk, MAX_DEFUDDLE_STDOUT_BYTES);
     });
 
     child.stderr.setEncoding("utf-8");
     child.stderr.on("data", (chunk: string) => {
-      stderr += chunk;
+      stderr = appendBounded(stderr, chunk, MAX_DEFUDDLE_STDERR_BYTES);
     });
 
     child.on("close", (code) => {

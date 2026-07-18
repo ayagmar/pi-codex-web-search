@@ -79,7 +79,7 @@ export function formatSettings(settings: WebSearchSettings): string {
     `  Deep: ${formatDuration(settings.deepTimeoutMs)}`,
     `  Defuddle: ${formatDuration(settings.defuddleTimeoutMs)}`,
     "",
-    "Query budgets:",
+    "Search-call budgets:",
     `  Fast: ${settings.fastQueryBudget}`,
     `  Deep: ${settings.deepQueryBudget}`,
   ].join("\n");

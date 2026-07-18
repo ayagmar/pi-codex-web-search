@@ -44,21 +44,28 @@ export interface WebSearchProgressDetails {
   query: string;
   mode: SearchMode;
   freshness: SearchFreshness;
+  /** Individual query strings issued, including batches within one web_search call. */
   searchCount: number;
+  /** Number of web_search tool calls. Budgets apply to this count, not batched query strings. */
+  searchCallCount: number;
   searchQueries: string[];
   pageActions?: string[];
   latestQuery?: string;
   statusText?: string;
   /** Milliseconds since the current Codex attempt started. */
   elapsedMs?: number;
-  /** Maximum number of web-search actions allowed for this attempt. */
+  /** Maximum number of web_search tool calls allowed for this attempt. */
   queryBudget?: number;
   /** Number of Codex subprocess attempts, including retries. */
   attempt?: number;
   /** Number of JSONL events observed from Codex. */
   eventCount?: number;
-  /** Internal monotonic-ish wall-clock start marker, omitted from rendered details. */
+  /** Internal wall-clock start marker, omitted from rendered details. */
   startedAt?: number;
+  /** Internal wall-clock marker of the most recent JSONL event. */
+  lastEventAt?: number;
+  /** Internal IDs used to avoid counting both started and completed events for one call. */
+  searchCallIds?: string[];
   statusEvents: string[];
 }
 

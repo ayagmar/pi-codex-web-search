@@ -107,7 +107,7 @@ void test("saveSettings writes normalized settings that loadSettings can read", 
   assert.match(formatted, /Defuddle behavior:/);
   assert.match(formatted, /Timeouts:/);
   assert.match(formatted, /Fast: 120s/);
-  assert.match(formatted, /Query budgets:/);
+  assert.match(formatted, /Search-call budgets:/);
 
   await rm(dir, { recursive: true, force: true });
 });
