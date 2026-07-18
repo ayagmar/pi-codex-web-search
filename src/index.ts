@@ -16,6 +16,7 @@ import {
   SETTINGS_COMMAND,
   TOOL_NAME,
 } from "./constants.js";
+import { createSearchGate } from "./search-gate.js";
 import {
   DEFAULT_WEB_SEARCH_SETTINGS,
   formatSettings,
@@ -62,8 +63,26 @@ const SETTINGS_ARGUMENT_OPTIONS = [
 
 export default function codexWebSearchExtension(pi: ExtensionAPI) {
   const turnState: WebSearchTurnState = { fastModeExhausted: false };
+  let currentSignal: AbortSignal | undefined;
+  let currentOnUpdate: Parameters<typeof executeCodexWebSearch>[1]["onUpdate"];
+  let currentCwd = process.cwd();
+
+  const searchGate = createSearchGate(async (_toolCallId, params) => {
+    const options: ExecuteCodexWebSearchOptions = {
+      cwd: currentCwd,
+      settings: await loadSettings(),
+      turnState,
+    };
+
+    if (currentSignal) options.signal = currentSignal;
+    if (currentOnUpdate) options.onUpdate = currentOnUpdate;
+
+    return executeCodexWebSearch(params, options);
+  });
+
   const resetTurnState = (): void => {
     turnState.fastModeExhausted = false;
+    searchGate.reset();
   };
 
   pi.on("turn_start", resetTurnState);
@@ -74,7 +93,7 @@ export default function codexWebSearchExtension(pi: ExtensionAPI) {
     name: TOOL_NAME,
     label: "Web Search",
     description:
-      "Search the public web through the locally installed Codex CLI and return a concise, source-backed answer. Use fast mode for normal lookups and deep mode for comparisons or broader research. Indexed search is the low-latency default; live search is used for clearly time-sensitive requests. Preserve the user's exact scope, constraints, dates, and named sites. Defuddle can extract direct URLs and optionally recover URL-based requests. Progress exposes the active phase, query count, budget, elapsed time, page inspections, retries, and failure cause. Timeouts, budgets, Defuddle behavior, and per-mode defaults are configurable via /web-search-settings. Output is truncated to Pi's standard limits when needed. Requires `codex` to be installed and authenticated on this machine.",
+      "Search the public web through the locally installed Codex CLI and return a concise, source-backed answer. Use fast mode for normal lookups and deep mode for comparisons or broader research. Never issue multiple web_search calls in parallel; combine related subquestions into one precise request, wait for its result, then search again only if needed. Indexed search is the low-latency default; live search is used for clearly time-sensitive requests. Preserve the user's exact scope, constraints, dates, and named sites. Defuddle can extract direct URLs and optionally recover URL-based requests. Progress exposes the active phase, query count, budget, elapsed time, page inspections, retries, and failure cause. Timeouts, budgets, Defuddle behavior, and per-mode defaults are configurable via /web-search-settings. Output is truncated to Pi's standard limits when needed. Requires `codex` to be installed and authenticated on this machine.",
     parameters: Type.Object({
       query: Type.String({ description: "What to search for on the web" }),
       maxSources: Type.Optional(
@@ -98,17 +117,12 @@ export default function codexWebSearchExtension(pi: ExtensionAPI) {
         })
       ),
     }),
-    async execute(_toolCallId, params, signal, onUpdate, ctx) {
-      const options: ExecuteCodexWebSearchOptions = {
-        cwd: ctx.cwd,
-        settings: await loadSettings(),
-        turnState,
-      };
+    async execute(toolCallId, params, signal, onUpdate, ctx) {
+      currentCwd = ctx.cwd;
+      currentSignal = signal;
+      currentOnUpdate = onUpdate;
 
-      if (signal) options.signal = signal;
-      if (onUpdate) options.onUpdate = onUpdate;
-
-      return executeCodexWebSearch(params, options);
+      return searchGate.execute(toolCallId, params) as ReturnType<typeof executeCodexWebSearch>;
     },
     renderCall(args, theme) {
       let text = theme.fg("toolTitle", theme.bold("web_search "));
@@ -125,7 +139,12 @@ export default function codexWebSearchExtension(pi: ExtensionAPI) {
         return new Text(renderProgress(details, expanded, theme), 0, 0);
       }
 
-      const details = result.details as Partial<CodexWebSearchDetails> | undefined;
+      const details = result.details as
+        | (Partial<CodexWebSearchDetails> & {
+            servedFromTurnCache?: boolean;
+            coalescedWithToolCallId?: string;
+          })
+        | undefined;
       if (!hasRenderableResultDetails(details)) {
         const content = result.content.find((part) => part.type === "text");
         const text = content?.type === "text" ? content.text : "";
@@ -148,15 +167,17 @@ export default function codexWebSearchExtension(pi: ExtensionAPI) {
           ? `⚠ ${formatFailureLabel(details.failure!)}`
           : `✓ ${details.sourceCount} source${details.sourceCount === 1 ? "" : "s"}`
       );
+      const searchCallCount =
+        typeof details.searchCallCount === "number" ? details.searchCallCount : details.searchCount;
       text += theme.fg(
         "muted",
-        ` from ${details.searchCount} search${details.searchCount === 1 ? "" : "es"} [${details.mode}/${details.freshness}]`
+        ` from ${details.searchCount} quer${details.searchCount === 1 ? "y" : "ies"} in ${searchCallCount} call${searchCallCount === 1 ? "" : "s"} [${details.mode}/${details.freshness}]`
       );
       if (details.elapsedMs !== undefined) {
         text += theme.fg("dim", ` · ${formatElapsed(details.elapsedMs)}`);
       }
       if (details.queryBudget !== undefined) {
-        text += theme.fg("dim", ` · budget ${details.searchCount}/${details.queryBudget}`);
+        text += theme.fg("dim", ` · call budget ${searchCallCount}/${details.queryBudget}`);
       }
 
       if (details.truncated) {
@@ -164,11 +185,17 @@ export default function codexWebSearchExtension(pi: ExtensionAPI) {
       }
 
       if (details.retry) {
-        text += theme.fg("warning", " (auto-escalated)");
+        text += theme.fg("warning", " (retried)");
       }
 
       if (details.defuddle) {
         text += theme.fg("warning", " (defuddle)");
+      }
+
+      if (details.servedFromTurnCache) {
+        text += theme.fg("dim", " (cached this turn)");
+      } else if (details.coalescedWithToolCallId) {
+        text += theme.fg("dim", " (coalesced)");
       }
 
       if (!expanded) {
@@ -361,14 +388,14 @@ async function handleSettingsCommand(args: string, ctx: ExtensionCommandContext)
       case "fast-query-budget": {
         const fastQueryBudget = parseQueryBudget(value, "fast query budget");
         const saved = await saveSettings({ ...settings, fastQueryBudget });
-        notify(ctx, `Fast query budget updated to ${saved.fastQueryBudget}.`);
+        notify(ctx, `Fast search-call budget updated to ${saved.fastQueryBudget}.`);
         return;
       }
 
       case "deep-query-budget": {
         const deepQueryBudget = parseQueryBudget(value, "deep query budget");
         const saved = await saveSettings({ ...settings, deepQueryBudget });
-        notify(ctx, `Deep query budget updated to ${saved.deepQueryBudget}.`);
+        notify(ctx, `Deep search-call budget updated to ${saved.deepQueryBudget}.`);
         return;
       }
 
@@ -390,7 +417,7 @@ async function openSettingsDialog(ctx: ExtensionCommandContext): Promise<void> {
         `Search defaults → mode ${settings.defaultMode}, fast ${settings.fastFreshness}/${settings.fastMaxSources}, deep ${settings.deepFreshness}/${settings.deepMaxSources}`,
         `Defuddle behavior → ${settings.defuddleMode}`,
         `Timeouts → fast ${settings.fastTimeoutMs} ms, deep ${settings.deepTimeoutMs} ms, Defuddle ${settings.defuddleTimeoutMs} ms`,
-        `Query budgets → fast ${settings.fastQueryBudget}, deep ${settings.deepQueryBudget}`,
+        `Search-call budgets → fast ${settings.fastQueryBudget}, deep ${settings.deepQueryBudget}`,
         "Reset to defaults",
       ]
     );
@@ -417,7 +444,7 @@ async function openSettingsDialog(ctx: ExtensionCommandContext): Promise<void> {
       continue;
     }
 
-    if (choice.startsWith("Query budgets")) {
+    if (choice.startsWith("Search-call budgets")) {
       await openQueryBudgetSettingsDialog(ctx);
       continue;
     }
@@ -585,19 +612,19 @@ async function openQueryBudgetSettingsDialog(ctx: ExtensionCommandContext): Prom
   while (true) {
     const settings = await loadSettings();
     const choice = await ctx.ui.select(
-      "Query budgets\nLimits how many distinct web searches Codex can issue per run.",
+      "Search-call budgets\nLimits how many web_search tool calls Codex can issue per run. Batched query strings count as one call.",
       [
-        `Fast query budget → ${settings.fastQueryBudget}`,
-        `Deep query budget → ${settings.deepQueryBudget}`,
+        `Fast search-call budget → ${settings.fastQueryBudget}`,
+        `Deep search-call budget → ${settings.deepQueryBudget}`,
         "Back",
       ]
     );
 
     if (!choice || choice === "Back") return;
 
-    if (choice.startsWith("Fast query budget")) {
+    if (choice.startsWith("Fast search-call budget")) {
       const value = await ctx.ui.input(
-        "Fast query budget\nFast mode warns near the limit and may auto-escalate once when defaults are in use.",
+        "Fast search-call budget\nCounts web_search tool calls, not query strings batched inside a call. Exceeding it fails the fast run for the rest of the turn.",
         String(settings.fastQueryBudget)
       );
       if (!value) continue;
@@ -606,7 +633,7 @@ async function openQueryBudgetSettingsDialog(ctx: ExtensionCommandContext): Prom
     }
 
     const value = await ctx.ui.input(
-      "Deep query budget\nIncrease this only when you want deeper Codex research loops.",
+      "Deep search-call budget\nCounts web_search tool calls, not batched query strings. Increase this only for deeper research loops.",
       String(settings.deepQueryBudget)
     );
     if (!value) continue;
@@ -636,7 +663,7 @@ function buildSettingsHelp(settings: WebSearchSettings): string {
     `/${SETTINGS_COMMAND} deep-timeout-ms <${MIN_TIMEOUT_MS}-${MAX_TIMEOUT_MS}>`,
     `/${SETTINGS_COMMAND} defuddle-timeout-ms <${MIN_TIMEOUT_MS}-${MAX_TIMEOUT_MS}>`,
     "",
-    "Query budgets:",
+    "Search-call budgets (command names retained for compatibility):",
     `/${SETTINGS_COMMAND} fast-query-budget <${MIN_QUERY_BUDGET}-${MAX_QUERY_BUDGET}>`,
     `/${SETTINGS_COMMAND} deep-query-budget <${MIN_QUERY_BUDGET}-${MAX_QUERY_BUDGET}>`,
     "",
@@ -710,9 +737,9 @@ function notify(
   console.log(message);
 }
 
-function hasRenderableResultDetails(
-  details: Partial<CodexWebSearchDetails> | undefined
-): details is CodexWebSearchDetails {
+function hasRenderableResultDetails<T extends Partial<CodexWebSearchDetails>>(
+  details: T | undefined
+): details is T & CodexWebSearchDetails {
   return (
     !!details &&
     (details.mode === "fast" || details.mode === "deep") &&
@@ -739,6 +766,7 @@ function renderProgress(
   }
 ): string {
   const searchCount = details?.searchCount ?? 0;
+  const searchCallCount = details?.searchCallCount ?? 0;
   const mode = details?.mode ?? "fast";
   const freshness = details?.freshness ?? "indexed";
   const statusText = details?.statusText ?? "Searching the web";
@@ -746,11 +774,11 @@ function renderProgress(
   const pageActions = details?.pageActions ?? [];
 
   let text = theme.fg("warning", statusText);
-  const budget = details?.queryBudget !== undefined ? `/${details.queryBudget}` : "";
+  const callBudget = details?.queryBudget !== undefined ? `/${details.queryBudget}` : "";
   const elapsed = details?.elapsedMs !== undefined ? ` · ${formatElapsed(details.elapsedMs)}` : "";
   text += theme.fg(
     "muted",
-    ` [${mode}/${freshness}] · ${searchCount}${budget} ${searchCount === 1 ? "query" : "queries"}${elapsed}`
+    ` [${mode}/${freshness}] · ${searchCount} ${searchCount === 1 ? "query" : "queries"} · ${searchCallCount}${callBudget} ${searchCallCount === 1 ? "call" : "calls"}${elapsed}`
   );
 
   if (!expanded) {
@@ -817,29 +845,19 @@ function formatFailureLabel(failure: CodexFailureDetails): string {
 }
 
 function formatRetrySummary(retry: RetryProvenance): string {
-  if (/budget/i.test(retry.fallbackReason)) {
-    return `Auto-escalated to deep/live after fast/${retry.originalFreshness} hit its query budget`;
-  }
-
-  if (/timed out/i.test(retry.fallbackReason)) {
-    return `Auto-escalated to deep/live after fast/${retry.originalFreshness} timed out`;
-  }
-
   if (
-    /reconnect|reconnecting|websocket|transport|stream disconnected/i.test(retry.fallbackReason)
+    /reconnect|reconnecting|websocket|transport|stream disconnected|connection|network|\b5\d\d\b/i.test(
+      retry.fallbackReason
+    )
   ) {
-    return `Auto-escalated to deep/live after fast/${retry.originalFreshness} lost its Codex transport`;
+    return `Retried as deep/live after fast/${retry.originalFreshness} lost its Codex transport`;
   }
 
-  if (/rate limit|too many requests|quota|429/i.test(retry.fallbackReason)) {
-    return `Auto-escalated to deep/live after fast/${retry.originalFreshness} hit a rate limit`;
-  }
-
-  return `Retried as deep/live after fast/${retry.originalFreshness} failed`;
+  return `Retried as deep/live after fast/${retry.originalFreshness} hit a transient failure`;
 }
 
 function looksLikeFailureText(text: string): boolean {
-  return /\b(failed|timed out|exceeded|error|could not|invalid|missing|cancelled|authentication)\b/i.test(
+  return /\b(failed|timed out|exceeded|error|could not|invalid|missing|cancelled|authentication|skipped)\b/i.test(
     text
   );
 }
