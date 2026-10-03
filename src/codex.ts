@@ -534,8 +534,12 @@ async function runResolvedCodexWebSearch(
 
   emitProgressUpdate(options, progress, `Running ${mode} Codex web search for: ${query}`);
 
+  // Aborted locally on inactivity or budget overruns, and through the caller's
+  // signal on cancellation.
   const abortController = new AbortController();
-  const signal = mergeAbortSignals(options.signal, abortController);
+  const signal = options.signal
+    ? AbortSignal.any([options.signal, abortController.signal])
+    : abortController.signal;
   const heartbeatId = setInterval(() => {
     if (signal.aborted) {
       return;
@@ -593,7 +597,7 @@ async function runResolvedCodexWebSearch(
           );
         }
 
-        if (progress.searchCallCount > policy.queryBudget && !abortController.signal.aborted) {
+        if (progress.searchCallCount > policy.queryBudget && !signal.aborted) {
           if (mode === "fast") {
             markFastModeExhausted(options.turnState);
             abortController.abort(
@@ -1431,25 +1435,6 @@ function emitProgressUpdate(
     content: [{ type: "text", text }],
     details,
   });
-}
-
-function mergeAbortSignals(
-  externalSignal: AbortSignal | undefined,
-  localController: AbortController
-): AbortSignal {
-  if (!externalSignal) {
-    return localController.signal;
-  }
-
-  if (externalSignal.aborted) {
-    localController.abort(externalSignal.reason);
-    return localController.signal;
-  }
-
-  externalSignal.addEventListener("abort", () => localController.abort(externalSignal.reason), {
-    once: true,
-  });
-  return localController.signal;
 }
 
 function collectProgressUpdates(
