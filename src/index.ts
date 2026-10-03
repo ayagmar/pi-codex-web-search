@@ -753,7 +753,9 @@ function notify(
     ctx.ui.notify(message, level);
     return;
   }
-  console.log(message);
+  // Print and json modes have no UI, and stdout belongs to pi there (the
+  // assistant output or the JSONL event stream), so report on stderr.
+  process.stderr.write(`${message}\n`);
 }
 
 function hasRenderableResultDetails<T extends Partial<CodexWebSearchDetails>>(
