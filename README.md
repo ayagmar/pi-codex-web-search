@@ -73,7 +73,13 @@ From npm:
 pi install npm:pi-codex-web-search
 ```
 
-From the repository path:
+From GitHub:
+
+```bash
+pi install git:github.com/ayagmar/pi-codex-web-search
+```
+
+From a local checkout:
 
 ```bash
 pi install /absolute/path/to/pi-codex-web-search
@@ -197,23 +203,18 @@ pnpm install
 pnpm run check
 ```
 
-## Release
+## Releasing
 
-This repo includes a manual GitHub Actions release workflow modeled after the one used in `pi-copilot-queue`.
+Releases are cut from GitHub Actions — never from a laptop.
 
-Requirements:
+1. Merge Conventional Commits (`feat:`, `fix:`, `feat!:` …) into `master`.
+2. Run **Actions → Release → Run workflow** (or `gh workflow run release.yml -f increment=auto`).
+   `auto` derives the bump from the commits; pick `patch`/`minor`/`major` to override. Tick `dry_run` to preview.
+3. The workflow runs `pnpm run check`, then release-it bumps `package.json`, updates `CHANGELOG.md`,
+   tags `vX.Y.Z`, pushes and creates the GitHub release, and finally `npm publish` publishes with
+   provenance through npm trusted publishing (OIDC — no npm token stored in the repo).
 
-- `NPM_TOKEN` GitHub Actions secret configured for the repository
-- permissions to run the `Release` workflow
-
-You can trigger it from GitHub Actions with a `patch`, `minor`, or `major` bump, plus an optional first-release flag.
-
-Local equivalents:
-
-```bash
-pnpm run release
-pnpm run release:first
-```
+Preview locally with `pnpm release:dry`.
 
 ## Notes
 
