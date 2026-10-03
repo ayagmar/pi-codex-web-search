@@ -69,6 +69,9 @@ interface SearchRunContext {
 
 export default function codexWebSearchExtension(pi: ExtensionAPI) {
   const turnState: WebSearchTurnState = { fastModeExhausted: false };
+  // Aborted on session_shutdown. Codex runs in its own process group, so an
+  // in-flight search would otherwise outlive a quit, reload or session switch.
+  const lifecycle = new AbortController();
 
   // Per-call state is passed through the gate instead of shared closure
   // variables: a skipped or coalesced sibling call must not replace the abort
@@ -80,7 +83,9 @@ export default function codexWebSearchExtension(pi: ExtensionAPI) {
       turnState,
     };
 
-    if (run.signal) options.signal = run.signal;
+    options.signal = run.signal
+      ? AbortSignal.any([run.signal, lifecycle.signal])
+      : lifecycle.signal;
     if (run.onUpdate) options.onUpdate = run.onUpdate;
 
     return executeCodexWebSearch(params, options);
@@ -94,6 +99,12 @@ export default function codexWebSearchExtension(pi: ExtensionAPI) {
   pi.on("turn_start", resetTurnState);
   pi.on("turn_end", resetTurnState);
   pi.on("agent_end", resetTurnState);
+  pi.on("session_shutdown", () => {
+    if (!lifecycle.signal.aborted) {
+      lifecycle.abort(new Error("Codex web search was cancelled because the Pi session ended."));
+    }
+    resetTurnState();
+  });
 
   pi.registerTool({
     name: TOOL_NAME,
