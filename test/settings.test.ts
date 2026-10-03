@@ -6,6 +6,7 @@ import test from "node:test";
 import {
   DEFAULT_WEB_SEARCH_SETTINGS,
   formatSettings,
+  getSettingsPath,
   loadSettings,
   normalizeSettings,
   saveSettings,
@@ -110,4 +111,22 @@ void test("saveSettings writes normalized settings that loadSettings can read", 
   assert.match(formatted, /Search-call budgets:/);
 
   await rm(dir, { recursive: true, force: true });
+});
+
+void test("settings are stored in the Pi agent directory from PI_CODING_AGENT_DIR", async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-codex-web-search-agent-dir-"));
+  const previous = process.env.PI_CODING_AGENT_DIR;
+  process.env.PI_CODING_AGENT_DIR = dir;
+  t.after(async () => {
+    if (previous === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = previous;
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  assert.equal(getSettingsPath(), join(dir, "pi-codex-web-search.settings.json"));
+
+  await saveSettings({ ...DEFAULT_WEB_SEARCH_SETTINGS, defaultMode: "deep" });
+  const raw = JSON.parse(await readFile(join(dir, "pi-codex-web-search.settings.json"), "utf-8"));
+  assert.equal(raw.defaultMode, "deep");
+  assert.equal((await loadSettings()).defaultMode, "deep");
 });

@@ -1,6 +1,6 @@
 import { mkdir, readFile, writeFile } from "node:fs/promises";
-import { homedir } from "node:os";
 import { dirname, join } from "node:path";
+import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import {
   DEEP_SEARCH_QUERY_BUDGET,
   DEEP_SEARCH_TIMEOUT_MS,
@@ -39,9 +39,17 @@ export const DEFAULT_WEB_SEARCH_SETTINGS: WebSearchSettings = {
   deepQueryBudget: DEEP_SEARCH_QUERY_BUDGET,
 };
 
-export const SETTINGS_PATH = join(homedir(), ".pi", "agent", "pi-codex-web-search.settings.json");
+export const SETTINGS_FILE_NAME = "pi-codex-web-search.settings.json";
 
-export async function loadSettings(path = SETTINGS_PATH): Promise<WebSearchSettings> {
+/**
+ * Settings live in Pi's agent directory, which honors PI_CODING_AGENT_DIR.
+ * Resolved on every call so a relocated agent dir is picked up at runtime.
+ */
+export function getSettingsPath(): string {
+  return join(getAgentDir(), SETTINGS_FILE_NAME);
+}
+
+export async function loadSettings(path = getSettingsPath()): Promise<WebSearchSettings> {
   try {
     const raw = await readFile(path, "utf-8");
     try {
@@ -59,7 +67,7 @@ export async function loadSettings(path = SETTINGS_PATH): Promise<WebSearchSetti
 
 export async function saveSettings(
   settings: Partial<WebSearchSettings>,
-  path = SETTINGS_PATH
+  path = getSettingsPath()
 ): Promise<WebSearchSettings> {
   const normalized = normalizeSettings(settings);
   await mkdir(dirname(path), { recursive: true });

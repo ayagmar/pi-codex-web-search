@@ -130,13 +130,22 @@ async function installHangingCodex(): Promise<{ dir: string; restore: () => Prom
   const dir = await mkdtemp(join(tmpdir(), "pi-codex-web-search-fake-codex-"));
   const command = join(dir, "codex");
   await writeFile(command, "#!/bin/sh\nexec sleep 30\n", { mode: 0o755 });
-  const previous = process.env.PI_CODEX_WEB_SEARCH_CODEX_PATH;
-  process.env.PI_CODEX_WEB_SEARCH_CODEX_PATH = command;
+  const overrides = {
+    PI_CODEX_WEB_SEARCH_CODEX_PATH: command,
+    // Keep the user's real web search settings out of the test.
+    PI_CODING_AGENT_DIR: dir,
+  };
+  const previous = Object.fromEntries(
+    Object.keys(overrides).map((key) => [key, process.env[key]] as const)
+  );
+  Object.assign(process.env, overrides);
   return {
     dir,
     restore: async () => {
-      if (previous === undefined) delete process.env.PI_CODEX_WEB_SEARCH_CODEX_PATH;
-      else process.env.PI_CODEX_WEB_SEARCH_CODEX_PATH = previous;
+      for (const [key, value] of Object.entries(previous)) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
       await rm(dir, { recursive: true, force: true });
     },
   };
