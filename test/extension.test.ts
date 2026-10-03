@@ -20,12 +20,15 @@ type CapturedToolExecute = (
   context: { cwd: string }
 ) => Promise<CapturedToolResult>;
 
+type CapturedCommandHandler = (args: string, ctx: unknown) => Promise<void>;
+
 interface CapturedExtension {
   toolName?: string;
   toolDescription?: string;
   toolExecute?: CapturedToolExecute;
   commandName?: string;
   commandDescription?: string;
+  commandHandler?: CapturedCommandHandler;
   handlers?: Map<string, ((event: unknown, ctx: unknown) => unknown)[]>;
 }
 
@@ -49,9 +52,13 @@ function createMockPi(captured: CapturedExtension): ExtensionAPI {
       captured.toolDescription = tool.description;
       captured.toolExecute = tool.execute;
     },
-    registerCommand: (name: string, command: { description: string }) => {
+    registerCommand: (
+      name: string,
+      command: { description: string; handler: CapturedCommandHandler }
+    ) => {
       captured.commandName = name;
       captured.commandDescription = command.description;
+      captured.commandHandler = command.handler;
     },
   } as unknown as ExtensionAPI;
 }
@@ -217,4 +224,62 @@ void test("session_shutdown cancels an in-flight search", {
   await emit(captured, "session_shutdown", { reason: "quit" });
 
   await assert.rejects(search, /session ended/);
+});
+
+async function captureOutput(
+  run: () => Promise<void>
+): Promise<{ stdout: string; stderr: string }> {
+  const output = { stdout: "", stderr: "" };
+  const originalStdout = process.stdout.write;
+  const originalStderr = process.stderr.write;
+  process.stdout.write = ((chunk: string | Uint8Array) => {
+    output.stdout += String(chunk);
+    return true;
+  }) as typeof process.stdout.write;
+  process.stderr.write = ((chunk: string | Uint8Array) => {
+    output.stderr += String(chunk);
+    return true;
+  }) as typeof process.stderr.write;
+  try {
+    await run();
+  } finally {
+    process.stdout.write = originalStdout;
+    process.stderr.write = originalStderr;
+  }
+  return output;
+}
+
+void test("settings command output without a UI goes to stderr, never stdout", async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-codex-web-search-agent-dir-"));
+  const previous = process.env.PI_CODING_AGENT_DIR;
+  process.env.PI_CODING_AGENT_DIR = dir;
+  t.after(async () => {
+    if (previous === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = previous;
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  const captured: CapturedExtension = {};
+  codexWebSearchExtension(createMockPi(captured));
+  const handler = captured.commandHandler;
+  assert.ok(handler);
+  const noUi = { notify: () => assert.fail("no UI is available") };
+
+  const json = await captureOutput(() =>
+    handler("status", { hasUI: false, mode: "json", ui: noUi, cwd: dir })
+  );
+  assert.equal(json.stdout, "");
+  assert.match(json.stderr, /Current web search settings/);
+
+  const print = await captureOutput(() =>
+    handler("status", { hasUI: false, mode: "print", ui: noUi, cwd: dir })
+  );
+  assert.equal(print.stdout, "");
+  assert.match(print.stderr, /Current web search settings/);
+
+  const printError = await captureOutput(() =>
+    handler("default-mode turbo", { hasUI: false, mode: "print", ui: noUi, cwd: dir })
+  );
+  assert.equal(printError.stdout, "");
+  assert.match(printError.stderr, /Invalid mode: turbo/);
 });
