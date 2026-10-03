@@ -318,10 +318,90 @@ void test("findBundledCodexExecutable locates npm-installed vendor binaries", as
   await writeFile(binary, process.platform === "win32" ? "@echo off\r\n" : "#!/bin/sh\n");
   await chmod(binary, 0o755);
 
-  const found = await findBundledCodexExecutable(dir);
+  const found = await findBundledCodexExecutable([join(dir, "node_modules", "@openai")]);
   assert.equal(found, binary);
 
   await rm(dir, { recursive: true, force: true });
+});
+
+async function writeFakeCodex(path: string, marker: string): Promise<void> {
+  await mkdir(dirname(path), { recursive: true });
+  await writeFile(path, `#!/bin/sh\necho ${marker}\n`, { mode: 0o755 });
+}
+
+async function withCodexLookupEnv(pathDir: string, run: () => Promise<void>): Promise<void> {
+  const previousPath = process.env.PATH;
+  const previousOverrides = [
+    "PI_CODEX_WEB_SEARCH_CODEX_PATH",
+    "PI_CODEX_WEB_SEARCH_CODEX",
+    "CODEX_PATH",
+  ].map((key) => [key, process.env[key]] as const);
+  process.env.PATH = pathDir;
+  for (const [key] of previousOverrides) delete process.env[key];
+  try {
+    await run();
+  } finally {
+    process.env.PATH = previousPath;
+    for (const [key, value] of previousOverrides) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
+}
+
+void test("runCodexCommand prefers PATH codex and never runs a workspace-local binary", {
+  skip: process.platform === "win32",
+}, async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-codex-web-search-lookup-"));
+  const pathDir = join(dir, "path-bin");
+  const projectA = join(dir, "project-a");
+  const projectB = join(dir, "project-b");
+  await writeFakeCodex(join(pathDir, "codex"), "PATH_CODEX");
+  await writeFakeCodex(
+    join(projectA, "node_modules", "@openai", "codex", "bin", "codex"),
+    "PROJECT_LOCAL"
+  );
+  await mkdir(projectB, { recursive: true });
+
+  try {
+    await withCodexLookupEnv(pathDir, async () => {
+      for (const cwd of [projectA, projectA, projectB]) {
+        const result = await runCodexCommand({ args: [], cwd });
+        assert.equal(result.stdout.trim(), "PATH_CODEX");
+      }
+    });
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+void test("runCodexCommand does not fall back to a workspace-local binary when PATH has no codex", {
+  skip: process.platform === "win32",
+}, async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-codex-web-search-lookup-"));
+  const emptyPathDir = join(dir, "empty-bin");
+  const project = join(dir, "project");
+  await mkdir(emptyPathDir, { recursive: true });
+  await writeFakeCodex(
+    join(project, "node_modules", "@openai", "codex", "bin", "codex"),
+    "PROJECT_LOCAL"
+  );
+
+  try {
+    await withCodexLookupEnv(emptyPathDir, async () => {
+      // A Codex installed globally on this machine may still be found; the
+      // project's own binary must never be.
+      const result = await runCodexCommand({ args: ["--version"], cwd: project }).catch(
+        (error: unknown) => {
+          assert.match(String(error), /Could not find `codex`/);
+          return undefined;
+        }
+      );
+      assert.doesNotMatch(result?.stdout ?? "", /PROJECT_LOCAL/);
+    });
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
 });
 
 void test("parseCodexWebSearchOutput validates and trims sources", () => {
