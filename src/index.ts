@@ -109,6 +109,12 @@ export default function codexWebSearchExtension(pi: ExtensionAPI) {
   pi.registerTool({
     name: TOOL_NAME,
     label: "Web Search",
+    // Pi 1.0 lists custom tools under "Available tools" in the default system
+    // prompt only when they provide a snippet.
+    promptSnippet: "Search the public web via the local Codex CLI for source-backed answers",
+    promptGuidelines: [
+      "Use web_search for current events or facts outside the workspace; issue one web_search call at a time and combine related subquestions into one request instead of searching in parallel.",
+    ],
     description:
       "Search the public web through the locally installed Codex CLI and return a concise, source-backed answer. Use fast mode for normal lookups and deep mode for comparisons or broader research. Never issue multiple web_search calls in parallel; combine related subquestions into one precise request, wait for its result, then search again only if needed. Indexed search is the low-latency default; live search is used for clearly time-sensitive requests. Preserve the user's exact scope, constraints, dates, and named sites. Defuddle can extract direct URLs and optionally recover URL-based requests. Progress exposes the active phase, query count, budget, elapsed time, page inspections, retries, and failure cause. Timeouts, budgets, Defuddle behavior, and per-mode defaults are configurable via /web-search-settings. Output is truncated to Pi's standard limits when needed. Requires `codex` to be installed and authenticated on this machine.",
     parameters: Type.Object({
