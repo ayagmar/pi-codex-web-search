@@ -22,6 +22,7 @@ import {
   getDirectUrlQuery,
   runDefuddleCommand,
 } from "./defuddle.js";
+import { formatElapsed } from "./format.js";
 import { DEFAULT_WEB_SEARCH_SETTINGS } from "./settings.js";
 import {
   type CodexFailureDetails,
@@ -1412,13 +1413,6 @@ export function getInactivityFailure(
   }
 
   return undefined;
-}
-
-function formatElapsed(milliseconds: number): string {
-  const seconds = Math.max(0, Math.round(milliseconds / 1_000));
-  if (seconds < 60) return `${seconds}s`;
-  const minutes = Math.floor(seconds / 60);
-  return `${minutes}m ${String(seconds % 60).padStart(2, "0")}s`;
 }
 
 function emitProgressUpdate(
