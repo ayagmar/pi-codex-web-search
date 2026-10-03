@@ -119,7 +119,7 @@ export async function runDefuddleCommand(
     const child = spawn(process.execPath, [cliPath, "parse", options.url, "--markdown", "--json"], {
       cwd: options.cwd,
       stdio: ["ignore", "pipe", "pipe"],
-      env: process.env,
+      env: getScriptRuntimeEnv(),
     });
 
     let stdout = "";
@@ -185,6 +185,19 @@ export async function runDefuddleCommand(
       }
     });
   });
+}
+
+/**
+ * Environment for running a script with `process.execPath`. In Pi's
+ * standalone (Bun-compiled) binary, process.execPath is Pi itself and would
+ * start Pi again instead of the script; BUN_BE_BUN makes it act as the
+ * embedded Bun runtime. Plain Node and `bun` ignore the variable.
+ */
+export function getScriptRuntimeEnv(
+  env: NodeJS.ProcessEnv = process.env,
+  isBunRuntime = !!process.versions.bun
+): NodeJS.ProcessEnv {
+  return isBunRuntime ? { ...env, BUN_BE_BUN: "1" } : env;
 }
 
 function resolveDefuddleCliPath(): string {

@@ -24,7 +24,12 @@ import {
   runCodexCommand,
 } from "../src/codex-command.js";
 import { DEFAULT_FAST_MAX_SOURCES, MAX_ALLOWED_SOURCES } from "../src/constants.js";
-import { extractUrlsFromText, getDirectUrlQuery, runDefuddleCommand } from "../src/defuddle.js";
+import {
+  extractUrlsFromText,
+  getDirectUrlQuery,
+  getScriptRuntimeEnv,
+  runDefuddleCommand,
+} from "../src/defuddle.js";
 import { DEFAULT_WEB_SEARCH_SETTINGS } from "../src/settings.js";
 import { type RunCodexCommand, type RunDefuddleCommand } from "../src/types.js";
 
@@ -2211,6 +2216,13 @@ void test("runCodexCommand does not spawn Codex for an already cancelled search"
     }
     await rm(dir, { recursive: true, force: true });
   }
+});
+
+void test("getScriptRuntimeEnv makes a Bun-compiled Pi binary run the Defuddle script", () => {
+  const env = { PATH: "/usr/bin" };
+  assert.equal(getScriptRuntimeEnv(env, false), env);
+  assert.deepEqual(getScriptRuntimeEnv(env, true), { PATH: "/usr/bin", BUN_BE_BUN: "1" });
+  assert.equal("BUN_BE_BUN" in env, false);
 });
 
 void test("runDefuddleCommand rejects an already cancelled extraction without fetching", async () => {
