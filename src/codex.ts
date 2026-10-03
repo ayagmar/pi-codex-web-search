@@ -80,8 +80,6 @@ interface CodexJsonlSummary {
   errorMessages: string[];
 }
 
-export { findBundledCodexExecutable, runCodexCommand } from "./codex-command.js";
-
 class CodexWebSearchFailure extends Error {
   readonly failure: CodexFailureDetails;
   readonly progress: WebSearchProgressDetails;
@@ -446,10 +444,6 @@ export async function executeCodexWebSearch(
           mode: "deep",
           freshness: "live",
         });
-
-        if (shouldExhaustFastModeInTurn(failure)) {
-          markFastModeExhausted(options.turnState);
-        }
 
         if (shouldThrowCodexFailure(retryFailureDetails)) {
           throw asError(retryFailureDetails, retryProgress);
