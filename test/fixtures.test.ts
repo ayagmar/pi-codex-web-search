@@ -1,10 +1,10 @@
-import test from "node:test";
 import assert from "node:assert/strict";
 import { readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
+import test from "node:test";
 import { fileURLToPath } from "node:url";
 import { executeCodexWebSearch } from "../src/codex.js";
-import type { RunCodexCommand } from "../src/types.js";
+import { type RunCodexCommand } from "../src/types.js";
 
 const FIXTURES_DIR = fileURLToPath(new URL("./fixtures", import.meta.url));
 

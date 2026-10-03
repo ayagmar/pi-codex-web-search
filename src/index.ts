@@ -1,8 +1,8 @@
 import { StringEnum } from "@earendil-works/pi-ai";
 import {
-  keyHint,
   type ExtensionAPI,
   type ExtensionCommandContext,
+  keyHint,
 } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
@@ -23,17 +23,17 @@ import {
   loadSettings,
   saveSettings,
 } from "./settings.js";
-import type {
-  CodexFailureDetails,
-  CodexWebSearchDetails,
-  DefuddleMode,
-  ExecuteCodexWebSearchOptions,
-  RetryProvenance,
-  SearchFreshness,
-  SearchMode,
-  WebSearchProgressDetails,
-  WebSearchSettings,
-  WebSearchTurnState,
+import {
+  type CodexFailureDetails,
+  type CodexWebSearchDetails,
+  type DefuddleMode,
+  type ExecuteCodexWebSearchOptions,
+  type RetryProvenance,
+  type SearchFreshness,
+  type SearchMode,
+  type WebSearchProgressDetails,
+  type WebSearchSettings,
+  type WebSearchTurnState,
 } from "./types.js";
 
 const SETTINGS_ARGUMENT_OPTIONS = [
@@ -160,11 +160,11 @@ export default function codexWebSearchExtension(pi: ExtensionAPI) {
       }
 
       const pageActions = Array.isArray(details.pageActions) ? details.pageActions : [];
-      const failed = !!details.failure;
+      const failure = details.failure;
       let text = theme.fg(
-        failed ? "warning" : "success",
-        failed
-          ? `⚠ ${formatFailureLabel(details.failure!)}`
+        failure ? "warning" : "success",
+        failure
+          ? `⚠ ${formatFailureLabel(failure)}`
           : `✓ ${details.sourceCount} source${details.sourceCount === 1 ? "" : "s"}`
       );
       const searchCallCount =

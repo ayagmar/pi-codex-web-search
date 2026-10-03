@@ -1,8 +1,8 @@
-import test from "node:test";
 import assert from "node:assert/strict";
 import { chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+import test from "node:test";
 import {
   buildCodexExecArgs,
   buildCodexPrompt,
@@ -23,10 +23,10 @@ import {
   MAX_CAPTURED_STDOUT_BYTES,
   runCodexCommand,
 } from "../src/codex-command.js";
-import { extractUrlsFromText, getDirectUrlQuery } from "../src/defuddle.js";
 import { DEFAULT_FAST_MAX_SOURCES, MAX_ALLOWED_SOURCES } from "../src/constants.js";
+import { extractUrlsFromText, getDirectUrlQuery } from "../src/defuddle.js";
 import { DEFAULT_WEB_SEARCH_SETTINGS } from "../src/settings.js";
-import type { RunCodexCommand, RunDefuddleCommand } from "../src/types.js";
+import { type RunCodexCommand, type RunDefuddleCommand } from "../src/types.js";
 
 void test("normalizeMaxSources clamps values into the supported range", () => {
   assert.equal(normalizeMaxSources(undefined), DEFAULT_FAST_MAX_SOURCES);

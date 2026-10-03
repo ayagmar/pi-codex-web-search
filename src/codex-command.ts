@@ -4,7 +4,7 @@ import { access, readdir } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import type { RunCodexCommandOptions, RunCodexCommandResult } from "./types.js";
+import { type RunCodexCommandOptions, type RunCodexCommandResult } from "./types.js";
 
 const CODEX_BINARY_NAMES =
   process.platform === "win32" ? ["codex.exe", "codex.cmd", "codex.bat", "codex"] : ["codex"];
