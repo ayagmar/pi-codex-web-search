@@ -46,7 +46,8 @@ The extension then:
 
 ## Requirements
 
-- Node.js 22+
+- Pi 1.0 or newer (`@earendil-works/pi-coding-agent` >= 1.0.1)
+- Node.js 22.19+
 - authenticated Codex CLI session
 - Codex CLI either:
   - available in `PATH`, or
@@ -78,6 +79,14 @@ From GitHub:
 ```bash
 pi install git:github.com/ayagmar/pi-codex-web-search
 ```
+
+Try it for a single session without installing:
+
+```bash
+pi -e npm:pi-codex-web-search
+```
+
+Update an installed copy with `pi update npm:pi-codex-web-search` (or `pi update --extensions`; a bare `pi update` only updates Pi itself).
 
 From a local checkout:
 
