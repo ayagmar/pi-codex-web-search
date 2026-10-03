@@ -1,4 +1,7 @@
 import assert from "node:assert/strict";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
 import { type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { SETTINGS_COMMAND, TOOL_NAME } from "../src/constants.js";
@@ -96,4 +99,73 @@ void test("extension coalesces identical concurrent web searches onto one run", 
 
   await assert.rejects(first, /non-empty query/);
   await assert.rejects(second, /non-empty query/);
+});
+
+async function waitFor(condition: () => boolean, timeoutMs = 5_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!condition()) {
+    if (Date.now() > deadline) {
+      throw new Error("Timed out waiting for condition");
+    }
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+}
+
+// A stand-in `codex` that never answers, so a search stays in flight until it
+// is aborted.
+async function installHangingCodex(): Promise<{ dir: string; restore: () => Promise<void> }> {
+  const dir = await mkdtemp(join(tmpdir(), "pi-codex-web-search-fake-codex-"));
+  const command = join(dir, "codex");
+  await writeFile(command, "#!/bin/sh\nexec sleep 30\n", { mode: 0o755 });
+  const previous = process.env.PI_CODEX_WEB_SEARCH_CODEX_PATH;
+  process.env.PI_CODEX_WEB_SEARCH_CODEX_PATH = command;
+  return {
+    dir,
+    restore: async () => {
+      if (previous === undefined) delete process.env.PI_CODEX_WEB_SEARCH_CODEX_PATH;
+      else process.env.PI_CODEX_WEB_SEARCH_CODEX_PATH = previous;
+      await rm(dir, { recursive: true, force: true });
+    },
+  };
+}
+
+void test("a skipped sibling call does not steal the running search's signal or progress", {
+  skip: process.platform === "win32",
+}, async (t) => {
+  const fake = await installHangingCodex();
+  t.after(fake.restore);
+
+  const captured: CapturedExtension = {};
+  codexWebSearchExtension(createMockPi(captured));
+  assert.ok(captured.toolExecute);
+
+  const context = { cwd: fake.dir };
+  const firstController = new AbortController();
+  const firstUpdates: unknown[] = [];
+  const siblingUpdates: unknown[] = [];
+
+  const first = captured.toolExecute(
+    "search-1",
+    { query: "first question" },
+    firstController.signal,
+    (update) => firstUpdates.push(update),
+    context
+  );
+  const sibling = await captured.toolExecute(
+    "search-2",
+    { query: "a different question" },
+    new AbortController().signal,
+    (update) => siblingUpdates.push(update),
+    context
+  );
+  assert.equal(
+    (sibling.details as { concurrentSearchSkipped?: boolean }).concurrentSearchSkipped,
+    true
+  );
+
+  await waitFor(() => firstUpdates.length > 0);
+  firstController.abort(new Error("user cancelled the first search"));
+
+  await assert.rejects(first, /cancelled/);
+  assert.equal(siblingUpdates.length, 0);
 });

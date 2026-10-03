@@ -166,3 +166,24 @@ void test("cache evicts oldest entries beyond the size limit", async () => {
   const details = cached.details as { servedFromTurnCache?: boolean };
   assert.equal(details.servedFromTurnCache, true);
 });
+
+void test("the running search receives its own call context, not a sibling's", async () => {
+  const seen: string[] = [];
+  let release: (() => void) | undefined;
+  const gate = createSearchGate<{ label: string }>(async (_toolCallId, _params, context) => {
+    await new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    seen.push(context.label);
+    return successResult("first result");
+  });
+
+  const first = gate.execute("call-1", { query: "first question" }, { label: "first" });
+  await gate.execute("call-2", { query: "second question" }, { label: "second" });
+  const coalesced = gate.execute("call-3", { query: "first question" }, { label: "third" });
+
+  release?.();
+  await Promise.all([first, coalesced]);
+
+  assert.deepEqual(seen, ["first"]);
+});
