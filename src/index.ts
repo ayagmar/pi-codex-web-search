@@ -61,21 +61,27 @@ const SETTINGS_ARGUMENT_OPTIONS = [
   "deep-query-budget 24",
 ] as const;
 
+interface SearchRunContext {
+  cwd: string;
+  signal?: AbortSignal;
+  onUpdate?: ExecuteCodexWebSearchOptions["onUpdate"];
+}
+
 export default function codexWebSearchExtension(pi: ExtensionAPI) {
   const turnState: WebSearchTurnState = { fastModeExhausted: false };
-  let currentSignal: AbortSignal | undefined;
-  let currentOnUpdate: Parameters<typeof executeCodexWebSearch>[1]["onUpdate"];
-  let currentCwd = process.cwd();
 
-  const searchGate = createSearchGate(async (_toolCallId, params) => {
+  // Per-call state is passed through the gate instead of shared closure
+  // variables: a skipped or coalesced sibling call must not replace the abort
+  // signal or progress callback of the call that is actually running.
+  const searchGate = createSearchGate<SearchRunContext>(async (_toolCallId, params, run) => {
     const options: ExecuteCodexWebSearchOptions = {
-      cwd: currentCwd,
+      cwd: run.cwd,
       settings: await loadSettings(),
       turnState,
     };
 
-    if (currentSignal) options.signal = currentSignal;
-    if (currentOnUpdate) options.onUpdate = currentOnUpdate;
+    if (run.signal) options.signal = run.signal;
+    if (run.onUpdate) options.onUpdate = run.onUpdate;
 
     return executeCodexWebSearch(params, options);
   });
@@ -118,11 +124,13 @@ export default function codexWebSearchExtension(pi: ExtensionAPI) {
       ),
     }),
     async execute(toolCallId, params, signal, onUpdate, ctx) {
-      currentCwd = ctx.cwd;
-      currentSignal = signal;
-      currentOnUpdate = onUpdate;
+      const run: SearchRunContext = { cwd: ctx.cwd };
+      if (signal) run.signal = signal;
+      if (onUpdate) run.onUpdate = onUpdate;
 
-      return searchGate.execute(toolCallId, params) as ReturnType<typeof executeCodexWebSearch>;
+      return searchGate.execute(toolCallId, params, run) as ReturnType<
+        typeof executeCodexWebSearch
+      >;
     },
     renderCall(args, theme) {
       let text = theme.fg("toolTitle", theme.bold("web_search "));

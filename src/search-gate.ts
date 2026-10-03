@@ -35,11 +35,23 @@ export function buildSearchKey(params: SearchGateParams): string {
  * - identical concurrent requests await the same in-flight promise,
  * - repeated requests within one turn are served from a small result cache,
  * - differing concurrent requests are skipped with guidance to combine them.
+ *
+ * `context` carries per-call state (abort signal, progress callback, cwd) and
+ * is handed to `run` for the call that actually starts the search, so sibling
+ * calls can never overwrite another call's signal or progress sink.
  */
-export function createSearchGate(
-  run: (toolCallId: string, params: SearchGateParams) => Promise<SearchGateResult>
+export function createSearchGate<TContext = void>(
+  run: (
+    toolCallId: string,
+    params: SearchGateParams,
+    context: TContext
+  ) => Promise<SearchGateResult>
 ): {
-  execute: (toolCallId: string, params: SearchGateParams) => Promise<SearchGateResult>;
+  execute: (
+    toolCallId: string,
+    params: SearchGateParams,
+    context: TContext
+  ) => Promise<SearchGateResult>;
   reset: () => void;
 } {
   let active: ActiveSearch | undefined;
@@ -47,7 +59,8 @@ export function createSearchGate(
 
   const execute = async (
     toolCallId: string,
-    params: SearchGateParams
+    params: SearchGateParams,
+    context: TContext
   ): Promise<SearchGateResult> => {
     const key = buildSearchKey(params);
 
@@ -72,7 +85,7 @@ export function createSearchGate(
       return buildSkippedResult(owner, params);
     }
 
-    const promise = run(toolCallId, params);
+    const promise = run(toolCallId, params, context);
     active = { toolCallId, query: params.query, key, promise };
 
     try {
