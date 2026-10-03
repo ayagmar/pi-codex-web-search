@@ -16,6 +16,7 @@ import {
   SETTINGS_COMMAND,
   TOOL_NAME,
 } from "./constants.js";
+import { formatElapsed } from "./format.js";
 import { createSearchGate } from "./search-gate.js";
 import {
   DEFAULT_WEB_SEARCH_SETTINGS,
@@ -918,13 +919,6 @@ function formatToolOutput(
     .split("\n")
     .map((line) => theme.fg("toolOutput", line))
     .join("\n");
-}
-
-function formatElapsed(milliseconds: number): string {
-  const seconds = Math.max(0, Math.round(milliseconds / 1_000));
-  if (seconds < 60) return `${seconds}s`;
-  const minutes = Math.floor(seconds / 60);
-  return `${minutes}m ${String(seconds % 60).padStart(2, "0")}s`;
 }
 
 function formatInlineQuery(query: unknown, maxLength = 90): string {
