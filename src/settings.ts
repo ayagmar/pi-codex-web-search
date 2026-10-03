@@ -1,6 +1,6 @@
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
-import { getAgentDir } from "@earendil-works/pi-coding-agent";
+import { getAgentDir, withFileMutationQueue } from "@earendil-works/pi-coding-agent";
 import {
   DEEP_SEARCH_QUERY_BUDGET,
   DEEP_SEARCH_TIMEOUT_MS,
@@ -14,6 +14,7 @@ import {
   MAX_TIMEOUT_MS,
   MIN_QUERY_BUDGET,
   MIN_TIMEOUT_MS,
+  SETTINGS_COMMAND,
 } from "./constants.js";
 import {
   type DefuddleMode,
@@ -49,29 +50,98 @@ export function getSettingsPath(): string {
   return join(getAgentDir(), SETTINGS_FILE_NAME);
 }
 
+export class InvalidSettingsFileError extends Error {
+  constructor(
+    readonly path: string,
+    reason: string
+  ) {
+    super(
+      `The web search settings file ${path} is not valid JSON (${reason}). web_search uses the default settings until it is fixed. Fix or delete the file, or run /${SETTINGS_COMMAND} reset.`
+    );
+    this.name = "InvalidSettingsFileError";
+  }
+}
+
+/**
+ * Settings for a web search. A missing or unreadable-as-JSON file falls back
+ * to the defaults so a broken settings file never breaks searching.
+ */
 export async function loadSettings(path = getSettingsPath()): Promise<WebSearchSettings> {
   try {
-    const raw = await readFile(path, "utf-8");
-    try {
-      return normalizeSettings(JSON.parse(raw) as unknown);
-    } catch {
-      return { ...DEFAULT_WEB_SEARCH_SETTINGS };
-    }
+    return await loadSettingsStrict(path);
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+    if (error instanceof InvalidSettingsFileError) {
       return { ...DEFAULT_WEB_SEARCH_SETTINGS };
     }
     throw error;
   }
 }
 
+/**
+ * Like loadSettings, but reports a settings file with invalid JSON instead of
+ * replacing it with defaults. Used before editing, so a save never silently
+ * overwrites the values a user put in a file with a typo.
+ */
+export async function loadSettingsStrict(path = getSettingsPath()): Promise<WebSearchSettings> {
+  let raw: string;
+  try {
+    raw = await readFile(path, "utf-8");
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+      return { ...DEFAULT_WEB_SEARCH_SETTINGS };
+    }
+    throw error;
+  }
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw) as unknown;
+  } catch (error) {
+    throw new InvalidSettingsFileError(
+      path,
+      error instanceof Error ? error.message : String(error)
+    );
+  }
+  return normalizeSettings(parsed);
+}
+
 export async function saveSettings(
   settings: Partial<WebSearchSettings>,
   path = getSettingsPath()
 ): Promise<WebSearchSettings> {
+  return withFileMutationQueue(path, () => writeSettingsFile(settings, path));
+}
+
+/**
+ * Applies `changes` to the saved settings as one read-modify-write, so
+ * concurrent updates cannot drop each other's values.
+ */
+export async function updateSettings(
+  changes: Partial<WebSearchSettings>,
+  path = getSettingsPath()
+): Promise<WebSearchSettings> {
+  return withFileMutationQueue(path, async () => {
+    const current = await loadSettingsStrict(path);
+    return writeSettingsFile({ ...current, ...changes }, path);
+  });
+}
+
+async function writeSettingsFile(
+  settings: Partial<WebSearchSettings>,
+  path: string
+): Promise<WebSearchSettings> {
   const normalized = normalizeSettings(settings);
   await mkdir(dirname(path), { recursive: true });
-  await writeFile(path, `${JSON.stringify(normalized, null, 2)}\n`, "utf-8");
+  // Write a sibling temp file and rename it into place, so a search that
+  // reads the settings concurrently never sees a half-written file.
+  const tempPath = `${path}.${process.pid}.${Date.now()}.tmp`;
+  try {
+    await writeFile(tempPath, `${JSON.stringify(normalized, null, 2)}\n`, "utf-8");
+    await rename(tempPath, path);
+  } catch (error) {
+    await rm(tempPath, { force: true });
+    throw error;
+  }
   return normalized;
 }
 

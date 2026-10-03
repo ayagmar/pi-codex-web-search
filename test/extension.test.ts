@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -298,4 +298,43 @@ void test("settings command output without a UI goes to stderr, never stdout", a
   );
   assert.equal(printError.stdout, "");
   assert.match(printError.stderr, /Invalid mode: turbo/);
+});
+
+void test("settings commands refuse to overwrite a settings file with invalid JSON", async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-codex-web-search-agent-dir-"));
+  const previous = process.env.PI_CODING_AGENT_DIR;
+  process.env.PI_CODING_AGENT_DIR = dir;
+  t.after(async () => {
+    if (previous === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = previous;
+    await rm(dir, { recursive: true, force: true });
+  });
+  const settingsPath = join(dir, "pi-codex-web-search.settings.json");
+  const broken = '{ "fastMaxSources": 9, "deepMaxSources": 8 ';
+  await writeFile(settingsPath, broken, "utf-8");
+
+  const captured: CapturedExtension = {};
+  codexWebSearchExtension(createMockPi(captured));
+  const handler = captured.commandHandler;
+  assert.ok(handler);
+  const notifications: { message: string; level: string }[] = [];
+  const ctx = {
+    hasUI: true,
+    cwd: dir,
+    ui: {
+      notify: (message: string, level = "info") => notifications.push({ message, level }),
+    },
+  };
+
+  await handler("default-mode deep", ctx);
+  assert.equal(await readFile(settingsPath, "utf-8"), broken);
+  assert.equal(notifications.at(-1)?.level, "error");
+  assert.match(notifications.at(-1)?.message ?? "", /not valid JSON[\s\S]*reset/);
+
+  await handler("status", ctx);
+  assert.equal(notifications.at(-1)?.level, "error");
+
+  await handler("reset", ctx);
+  assert.equal(notifications.at(-1)?.level, "info");
+  assert.equal(JSON.parse(await readFile(settingsPath, "utf-8")).fastMaxSources, 5);
 });
