@@ -185,6 +185,7 @@ Notes:
 
 - `default-max-sources` is kept as a compatibility alias and updates both `fast-max-sources` and `deep-max-sources`.
 - The settings file is `pi-codex-web-search.settings.json` in your Pi agent directory (`~/.pi/agent` by default, or `$PI_CODING_AGENT_DIR` when set) and is reused by future sessions.
+- Upgrading from 0.1.x with `PI_CODING_AGENT_DIR` set: older versions always used `~/.pi/agent/pi-codex-web-search.settings.json`. Move that file to `$PI_CODING_AGENT_DIR/` to keep your saved settings; it is not read from the old location.
 - If that file contains invalid JSON, searches use the defaults and `/web-search-settings` reports the problem instead of overwriting your values; fix the file or run `/web-search-settings reset`.
 - Defaults include `defuddle-mode = direct` for URL-only extraction without surprising non-URL search behavior.
 - Timeouts and search-call budgets are configurable for both fast and deep modes. Existing `fast-query-budget` and `deep-query-budget` command names are retained for compatibility.
