@@ -16,7 +16,7 @@ import {
   SETTINGS_COMMAND,
   TOOL_NAME,
 } from "./constants.js";
-import { formatElapsed } from "./format.js";
+import { formatElapsed, formatInlineQuery } from "./format.js";
 import { createSearchGate } from "./search-gate.js";
 import {
   DEFAULT_WEB_SEARCH_SETTINGS,
@@ -919,10 +919,4 @@ function formatToolOutput(
     .split("\n")
     .map((line) => theme.fg("toolOutput", line))
     .join("\n");
-}
-
-function formatInlineQuery(query: unknown, maxLength = 90): string {
-  const text = typeof query === "string" ? query.trim() : "";
-  if (!text) return "…";
-  return text.length > maxLength ? `${text.slice(0, maxLength - 1)}…` : text;
 }
