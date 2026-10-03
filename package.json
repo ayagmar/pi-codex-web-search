@@ -2,44 +2,49 @@
   "name": "pi-codex-web-search",
   "version": "0.1.9",
   "description": "Pi extension that exposes web search through the local Codex CLI",
-  "homepage": "https://github.com/ayagmar/pi-codex-web-search",
-  "bugs": {
-    "url": "https://github.com/ayagmar/pi-codex-web-search/issues"
-  },
-  "repository": {
-    "type": "git",
-    "url": "https://github.com/ayagmar/pi-codex-web-search.git"
-  },
   "keywords": [
     "pi-package",
     "pi-extension",
     "codex",
     "web-search"
   ],
+  "license": "MIT",
+  "author": "ayagmar",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ayagmar/pi-codex-web-search.git"
+  },
+  "homepage": "https://github.com/ayagmar/pi-codex-web-search#readme",
+  "bugs": {
+    "url": "https://github.com/ayagmar/pi-codex-web-search/issues"
+  },
   "type": "module",
   "main": "./src/index.ts",
   "files": [
     "src/",
     "README.md",
+    "CHANGELOG.md",
     "LICENSE"
   ],
-  "scripts": {
-    "lint": "biome lint --error-on-warnings .",
-    "lint:fix": "biome check --write .",
-    "format": "biome format --write .",
-    "format:check": "biome format .",
-    "typecheck": "tsc --noEmit -p tsconfig.json",
-    "smoke-test": "node --import=tsx ./scripts/smoke-test.mjs",
-    "test": "node --import=tsx --test ./test/*.test.ts",
-    "check": "pnpm run typecheck && pnpm run lint && pnpm run format:check && pnpm run test && pnpm run smoke-test",
-    "release": "release-it",
-    "release:first": "release-it --first-release"
-  },
   "pi": {
     "extensions": [
       "./src/index.ts"
     ],
     "image": "https://raw.githubusercontent.com/ayagmar/pi-codex-web-search/master/docs/images/web-search-demo.png"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "lint": "biome lint --error-on-warnings .",
+    "lint:fix": "biome check --write .",
+    "format": "biome format --write .",
+    "format:check": "biome format .",
+    "test": "node --import=tsx --test ./test/*.test.ts",
+    "smoke-test": "node --import=tsx ./scripts/smoke-test.mjs",
+    "check": "pnpm run typecheck && pnpm run lint && pnpm run format:check && pnpm run test && pnpm run smoke-test",
+    "release:dry": "release-it --ci --dry-run"
+  },
+  "dependencies": {
+    "defuddle": "0.19.1"
   },
   "peerDependencies": {
     "@earendil-works/pi-ai": "*",
@@ -52,18 +57,18 @@
     "@earendil-works/pi-ai": "^0.80.0",
     "@earendil-works/pi-coding-agent": "^0.80.0",
     "@earendil-works/pi-tui": "^0.80.0",
-    "@release-it/conventional-changelog": "^10.0.5",
-    "@types/node": "^22.19.10",
-    "release-it": "^19.2.4",
+    "@release-it/conventional-changelog": "^12.0.2",
+    "@types/node": "^24.19.1",
+    "release-it": "^21.1.0",
     "tsx": "^4.21.0",
     "typebox": "^1.1.38",
     "typescript": "^5.9.3"
   },
-  "license": "MIT",
   "engines": {
-    "node": ">=22"
+    "node": ">=22.19.0"
   },
-  "dependencies": {
-    "defuddle": "0.19.1"
+  "packageManager": "pnpm@12.8.1",
+  "publishConfig": {
+    "access": "public"
   }
 }
