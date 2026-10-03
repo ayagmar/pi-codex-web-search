@@ -7,6 +7,7 @@ import {
   DEFAULT_MAX_LINES,
   formatSize,
   truncateHead,
+  truncateLine,
 } from "@earendil-works/pi-coding-agent";
 import { runCodexCommand } from "./codex-command.js";
 import {
@@ -1162,18 +1163,25 @@ function shouldThrowCodexFailure(failure: CodexFailureDetails): boolean {
 
 function buildCodexFailure(result: RunCodexCommandResult): CodexFailureDetails {
   const stdoutSummary = summarizeCodexStdout(result.stdout);
-  const details = [
-    stdoutSummary.turnFailedMessage,
-    stdoutSummary.errorMessages.at(-1),
-    result.stderr.trim(),
-    tailLines(result.stdout, 12),
-  ]
-    .filter(Boolean)
-    .join("\n\n");
-  const message = details
-    ? `codex exec failed with exit code ${result.code}.\n\n${details}`
-    : `codex exec failed with exit code ${result.code}.`;
-  const classified = classifyFailureText(message);
+  const headline = `codex exec failed with exit code ${result.code}.`;
+  const errorDetails = dedupeStrings(
+    [
+      stdoutSummary.turnFailedMessage,
+      stdoutSummary.errorMessages.at(-1),
+      tailLines(result.stderr, MAX_FAILURE_STDERR_LINES),
+    ].filter((detail): detail is string => !!detail)
+  ).map((detail) => boundFailureDetail(detail, MAX_FAILURE_ERROR_CHARS));
+  const stdoutTail = tailLines(result.stdout, MAX_FAILURE_STDOUT_LINES)
+    .split("\n")
+    .map((line) => boundFailureDetail(line, MAX_FAILURE_LINE_CHARS))
+    .join("\n");
+  const message = [headline, ...errorDetails, stdoutTail].filter(Boolean).join("\n\n");
+  // Classify on what Codex reported as errors. The stdout tail is ordinary
+  // research activity (queries, URLs, answers) kept only for diagnostics: a
+  // query about a "login" page must not look like an auth failure.
+  const classified = classifyFailureText(
+    errorDetails.length > 0 ? [headline, ...errorDetails].join("\n\n") : message
+  );
 
   if (classified.kind === "auth") {
     return createCodexFailure(
@@ -1242,6 +1250,17 @@ function classifyFailureText(message: string): CodexFailureDetails {
   }
 
   return createCodexFailure("unknown", message, false);
+}
+
+// Failure messages reach the model and the session file, so the diagnostics
+// copied from Codex's output are bounded.
+const MAX_FAILURE_STDOUT_LINES = 12;
+const MAX_FAILURE_STDERR_LINES = 20;
+const MAX_FAILURE_LINE_CHARS = 500;
+const MAX_FAILURE_ERROR_CHARS = 4_000;
+
+function boundFailureDetail(text: string, maxChars: number): string {
+  return truncateLine(text, maxChars).text;
 }
 
 function tailLines(text: string, count: number): string {

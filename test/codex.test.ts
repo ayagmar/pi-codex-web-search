@@ -2064,6 +2064,60 @@ void test("executeCodexWebSearch surfaces codex execution failures", async () =>
   );
 });
 
+void test("executeCodexWebSearch classifies exit failures by Codex errors, not by search activity", async () => {
+  // The stdout tail holds ordinary research events. A query that mentions
+  // "login" or a status code must not turn a transport failure into a
+  // non-recoverable auth or other misclassified failure.
+  const stdoutLines = [
+    JSON.stringify({
+      type: "item.completed",
+      item: {
+        id: "ws_1",
+        type: "web_search",
+        action: { type: "search", query: "github login page returns 403 forbidden" },
+      },
+    }),
+    JSON.stringify({
+      type: "turn.failed",
+      error: { message: "stream disconnected before completion: error sending request" },
+    }),
+  ];
+  const runner: RunCodexCommand = () =>
+    Promise.resolve({ code: 1, stdout: stdoutLines.join("\n"), stderr: "" });
+
+  const result = await executeCodexWebSearch(
+    { query: "why does the github login page return 403", mode: "deep" },
+    {
+      cwd: process.cwd(),
+      runner,
+      settings: { ...DEFAULT_WEB_SEARCH_SETTINGS, defuddleMode: "off" },
+    }
+  );
+
+  assert.equal(result.details.failure?.kind, "transport");
+  assert.equal(result.details.failure?.recoverable, true);
+  // The stdout tail is still kept for diagnostics.
+  assert.match(result.details.failure?.message ?? "", /github login page/);
+});
+
+void test("executeCodexWebSearch bounds the stdout tail kept in failure messages", async () => {
+  const hugeLine = JSON.stringify({ type: "item.completed", item: { text: "x".repeat(200_000) } });
+  const runner: RunCodexCommand = () =>
+    Promise.resolve({ code: 1, stdout: `${hugeLine}\n`, stderr: "stream disconnected" });
+
+  const result = await executeCodexWebSearch(
+    { query: "bounded failure", mode: "deep" },
+    {
+      cwd: process.cwd(),
+      runner,
+      settings: { ...DEFAULT_WEB_SEARCH_SETTINGS, defuddleMode: "off" },
+    }
+  );
+
+  assert.equal(result.details.failure?.kind, "transport");
+  assert.ok((result.details.failure?.message.length ?? 0) < 5_000);
+});
+
 void test("executeCodexWebSearch treats a dead-connection startup timeout as a timeout, not an auth failure", async () => {
   const now = Date.now();
   const startupFailure = getInactivityFailure(
