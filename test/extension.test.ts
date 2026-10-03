@@ -25,6 +25,8 @@ type CapturedCommandHandler = (args: string, ctx: unknown) => Promise<void>;
 interface CapturedExtension {
   toolName?: string;
   toolDescription?: string;
+  toolPromptSnippet?: string;
+  toolPromptGuidelines?: string[];
   toolExecute?: CapturedToolExecute;
   commandName?: string;
   commandDescription?: string;
@@ -47,9 +49,18 @@ function createMockPi(captured: CapturedExtension): ExtensionAPI {
       captured.handlers.set(event, handlers);
       return () => undefined;
     },
-    registerTool: (tool: { name: string; description: string; execute: CapturedToolExecute }) => {
+    registerTool: (tool: {
+      name: string;
+      description: string;
+      promptSnippet?: string;
+      promptGuidelines?: string[];
+      execute: CapturedToolExecute;
+    }) => {
       captured.toolName = tool.name;
       captured.toolDescription = tool.description;
+      if (tool.promptSnippet !== undefined) captured.toolPromptSnippet = tool.promptSnippet;
+      if (tool.promptGuidelines !== undefined)
+        captured.toolPromptGuidelines = tool.promptGuidelines;
       captured.toolExecute = tool.execute;
     },
     registerCommand: (
@@ -70,6 +81,11 @@ void test("extension registers the web_search tool and settings command", () => 
   assert.equal(captured.toolName, TOOL_NAME);
   assert.match(captured.toolDescription ?? "", /Codex CLI/);
   assert.match(captured.toolDescription ?? "", /Never issue multiple web_search calls in parallel/);
+  // Without a snippet pi 1.0 leaves the tool out of the system prompt's tool list.
+  assert.match(captured.toolPromptSnippet ?? "", /Codex CLI/);
+  assert.ok(
+    captured.toolPromptGuidelines?.some((line) => /one web_search call at a time/.test(line))
+  );
   assert.equal(captured.commandName, SETTINGS_COMMAND);
   assert.match(
     captured.commandDescription ?? "",
