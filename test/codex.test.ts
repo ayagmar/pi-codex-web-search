@@ -2208,6 +2208,32 @@ void test("executeCodexWebSearch classifies exit failures by Codex errors, not b
   assert.match(result.details.failure?.message ?? "", /github login page/);
 });
 
+void test("executeCodexWebSearch never classifies exit failures on stdout when Codex printed no error", async () => {
+  // A crash or a signal kill exits non-zero (`code ?? 1`) with nothing on
+  // stderr and no turn.failed/error event. The research activity on stdout
+  // must not decide the failure kind.
+  for (const searchQuery of ["github login page", "how to cancel a subscription"]) {
+    const stdout = `${JSON.stringify({
+      type: "item.completed",
+      item: { id: "ws_1", type: "web_search", action: { type: "search", query: searchQuery } },
+    })}\n`;
+    const runner: RunCodexCommand = () => Promise.resolve({ code: 1, stdout, stderr: "" });
+
+    const result = await executeCodexWebSearch(
+      { query: "q", mode: "deep" },
+      {
+        cwd: process.cwd(),
+        runner,
+        settings: { ...DEFAULT_WEB_SEARCH_SETTINGS, defuddleMode: "off" },
+      }
+    );
+
+    assert.equal(result.details.failure?.kind, "unknown", searchQuery);
+    // The stdout tail is still kept for diagnostics.
+    assert.ok(result.details.failure?.message.includes(searchQuery), searchQuery);
+  }
+});
+
 void test("executeCodexWebSearch bounds the stdout tail kept in failure messages", async () => {
   const hugeLine = JSON.stringify({ type: "item.completed", item: { text: "x".repeat(200_000) } });
   const runner: RunCodexCommand = () =>
