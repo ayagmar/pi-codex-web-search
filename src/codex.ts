@@ -1190,11 +1190,9 @@ function buildCodexFailure(result: RunCodexCommandResult): CodexFailureDetails {
   // Classify on what Codex reported as errors, before any length bound so a
   // long stderr tail cannot hide the final error line. The stdout tail is
   // ordinary research activity (queries, URLs, answers) kept only for
-  // diagnostics: a query about a "login" page must not look like an auth
-  // failure.
-  const classified = classifyFailureText(
-    errorSources.length > 0 ? [headline, ...errorSources].join("\n\n") : message
-  );
+  // diagnostics, even when Codex reported nothing else (a crash or a signal
+  // kill): a query about a "login" page must not look like an auth failure.
+  const classified = classifyFailureText([headline, ...errorSources].join("\n\n"));
 
   if (classified.kind === "auth") {
     return createCodexFailure(
