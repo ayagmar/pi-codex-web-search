@@ -2063,3 +2063,40 @@ void test("executeCodexWebSearch surfaces codex execution failures", async () =>
     /codex exec failed with exit code 7[\s\S]*authentication required[\s\S]*codex login status[\s\S]*codex login/
   );
 });
+
+void test("executeCodexWebSearch treats a dead-connection startup timeout as a timeout, not an auth failure", async () => {
+  const now = Date.now();
+  const startupFailure = getInactivityFailure(
+    {
+      query: "q",
+      mode: "fast",
+      freshness: "indexed",
+      searchCount: 0,
+      searchCallCount: 0,
+      searchQueries: [],
+      pageActions: [],
+      statusEvents: [],
+      eventCount: 0,
+      startedAt: now - 31_000,
+    },
+    90_000
+  );
+  assert.ok(startupFailure);
+  // The hint mentions `codex login status`, which must not make it look like an auth problem.
+  assert.match(startupFailure, /codex login status/);
+
+  const turnState = { fastModeExhausted: false };
+  const result = await executeCodexWebSearch(
+    { query: "latest codex release notes", mode: "fast", freshness: "indexed" },
+    {
+      cwd: process.cwd(),
+      runner: () => Promise.reject(new Error(startupFailure)),
+      settings: { ...DEFAULT_WEB_SEARCH_SETTINGS, defuddleMode: "off" },
+      turnState,
+    }
+  );
+
+  assert.equal(result.details.failure?.kind, "timeout");
+  assert.equal(result.details.failure?.recoverable, true);
+  assert.equal(turnState.fastModeExhausted, true);
+});

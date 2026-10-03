@@ -1195,6 +1195,12 @@ function classifyFailureText(message: string): CodexFailureDetails {
     return createCodexFailure("local_config", message, false);
   }
 
+  // Our own wall-clock and inactivity timeouts. They can mention
+  // `codex login status` as a hint, so they must win over the auth check.
+  if (/^Codex web search timed out\b/i.test(message)) {
+    return createCodexFailure("timeout", message, true);
+  }
+
   if (needsCodexAuthHelp(message)) {
     return createCodexFailure("auth", message, false);
   }
