@@ -354,13 +354,21 @@ export function formatWebSearchResult(result: CodexWebSearchOutput): string {
   return lines.join("\n");
 }
 
+/**
+ * A web_search tool result. Recoverable failures are still returned (so their
+ * details reach the renderer) but flagged with `isError`, so the model, the UI
+ * and `tool_result` hooks all see the call as failed.
+ */
+export interface CodexWebSearchResult {
+  content: { type: "text"; text: string }[];
+  details: CodexWebSearchDetails;
+  isError?: true;
+}
+
 export async function executeCodexWebSearch(
   input: WebSearchInput,
   options: ExecuteCodexWebSearchOptions
-): Promise<{
-  content: { type: "text"; text: string }[];
-  details: CodexWebSearchDetails;
-}> {
+): Promise<CodexWebSearchResult> {
   const runner = options.runner ?? runCodexCommand;
   const settings = options.settings ?? DEFAULT_WEB_SEARCH_SETTINGS;
   const resolvedInput = resolveWebSearchInput(input, settings);
@@ -710,10 +718,7 @@ async function buildSoftFailureResult(
   progress: WebSearchProgressDetails,
   failure: CodexFailureDetails,
   retry?: RetryProvenance
-): Promise<{
-  content: { type: "text"; text: string }[];
-  details: CodexWebSearchDetails;
-}> {
+): Promise<CodexWebSearchResult> {
   const summary = buildSoftFailureSummary(failure, retry);
   updateProgressElapsed(progress);
   const renderedResult = await renderToolResult(buildSoftFailureBody(summary, failure));
@@ -750,6 +755,7 @@ async function buildSoftFailureResult(
   return {
     content: [{ type: "text", text: renderedResult.text }],
     details,
+    isError: true,
   };
 }
 

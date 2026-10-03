@@ -10,6 +10,7 @@ export interface SearchGateParams {
 export interface SearchGateResult {
   content: { type: "text"; text: string }[];
   details: object;
+  isError?: boolean;
 }
 
 interface ActiveSearch {
@@ -66,18 +67,16 @@ export function createSearchGate<TContext = void>(
 
     const cached = turnCache.get(key);
     if (cached) {
-      return {
-        content: cached.content,
-        details: { ...cached.details, servedFromTurnCache: true },
-      };
+      return { ...cached, details: { ...cached.details, servedFromTurnCache: true } };
     }
 
     if (active) {
       const owner = active;
       if (owner.key === key) {
         const result = await owner.promise;
+        // Keep `isError`: a duplicate of a failed search failed too.
         return {
-          content: result.content,
+          ...result,
           details: { ...result.details, coalescedWithToolCallId: owner.toolCallId },
         };
       }

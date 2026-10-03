@@ -1257,6 +1257,8 @@ void test("executeCodexWebSearch does not retry fast timeouts as deep/live", asy
   assert.equal(attempts, 1);
   assert.equal(result.details.mode, "fast");
   assert.equal(result.details.failure?.kind, "timeout");
+  // A recoverable failure is still returned, but flagged as a tool error.
+  assert.equal(result.isError, true);
   assert.equal(result.details.retry, undefined);
   assert.equal(turnState.fastModeExhausted, true);
 });
@@ -1466,6 +1468,7 @@ void test("executeCodexWebSearch budgets batched queries by web_search call", as
   );
 
   assert.equal(result.details.failure, undefined);
+  assert.equal(result.isError, undefined);
   assert.equal(result.details.searchCallCount, 2);
   assert.equal(result.details.searchCount, 12);
   assert.equal(
@@ -1916,6 +1919,7 @@ void test("executeCodexWebSearch soft-fails repeated fast retries within the sam
 
   assert.equal(invoked, false);
   assert.equal(result.details.failure?.kind, "budget");
+  assert.equal(result.isError, true);
   assert.match(result.content[0]?.text ?? "", /failed earlier in this turn/i);
 });
 

@@ -129,6 +129,31 @@ void test("failed results are not cached", async () => {
   assert.equal(second.content[0]?.text, "recovered");
 });
 
+void test("a coalesced duplicate of a failed search is flagged as an error too", async () => {
+  let release: (() => void) | undefined;
+  const gate = createSearchGate(async (): Promise<SearchGateResult> => {
+    await new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    return {
+      content: [{ type: "text", text: "Web search timed out" }],
+      details: { failure: { kind: "timeout", message: "timed out", recoverable: true } },
+      isError: true,
+    };
+  });
+
+  const first = gate.execute("call-1", { query: "slow question" });
+  const second = gate.execute("call-2", { query: "slow question" });
+  release?.();
+  const [firstResult, secondResult] = await Promise.all([first, second]);
+
+  assert.equal(firstResult.isError, true);
+  assert.equal(secondResult.isError, true);
+  const coalesced = secondResult.details as { coalescedWithToolCallId?: string; failure?: unknown };
+  assert.equal(coalesced.coalescedWithToolCallId, "call-1");
+  assert.ok(coalesced.failure);
+});
+
 void test("thrown runs release the gate for the next search", async () => {
   let runs = 0;
   const gate = createSearchGate(() => {
