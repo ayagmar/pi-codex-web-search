@@ -166,6 +166,11 @@ async function isExecutableFile(path: string): Promise<boolean> {
   }
 }
 
+export function toCancellationError(reason: unknown, fallbackMessage: string): Error {
+  if (reason instanceof Error) return reason;
+  return new Error(typeof reason === "string" ? reason : fallbackMessage);
+}
+
 function terminateChild(
   child: ReturnType<typeof spawn>,
   afterTerminate?: () => void,
@@ -188,6 +193,14 @@ function spawnCodexCommand(
   options: RunCodexCommandOptions
 ): Promise<RunCodexCommandResult> {
   return new Promise<RunCodexCommandResult>((resolve, reject) => {
+    // Never start Codex for a search that is already cancelled: the child
+    // would only be killed again, and a spawn failure (ENOENT) would surface
+    // as an unhandled "error" event once no listener is attached.
+    if (options.signal?.aborted) {
+      reject(toCancellationError(options.signal.reason, "Codex web search was cancelled."));
+      return;
+    }
+
     const child = spawn(command, options.args, {
       cwd: options.cwd,
       stdio: ["pipe", "pipe", "pipe"],
@@ -219,18 +232,9 @@ function spawnCodexCommand(
 
     const onAbort = (): void => {
       terminateChild(child, scheduleForceKill);
-      const reason: unknown = options.signal?.reason;
-      const error =
-        reason instanceof Error
-          ? reason
-          : new Error(typeof reason === "string" ? reason : "Codex web search was cancelled.");
+      const error = toCancellationError(options.signal?.reason, "Codex web search was cancelled.");
       finish(() => reject(error));
     };
-
-    if (options.signal?.aborted) {
-      onAbort();
-      return;
-    }
 
     if (options.timeoutMs !== undefined) {
       const timeoutMs = options.timeoutMs;

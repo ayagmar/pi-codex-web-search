@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test from "node:test";
@@ -24,7 +24,7 @@ import {
   runCodexCommand,
 } from "../src/codex-command.js";
 import { DEFAULT_FAST_MAX_SOURCES, MAX_ALLOWED_SOURCES } from "../src/constants.js";
-import { extractUrlsFromText, getDirectUrlQuery } from "../src/defuddle.js";
+import { extractUrlsFromText, getDirectUrlQuery, runDefuddleCommand } from "../src/defuddle.js";
 import { DEFAULT_WEB_SEARCH_SETTINGS } from "../src/settings.js";
 import { type RunCodexCommand, type RunDefuddleCommand } from "../src/types.js";
 
@@ -2099,6 +2099,58 @@ void test("executeCodexWebSearch treats a dead-connection startup timeout as a t
   assert.equal(result.details.failure?.kind, "timeout");
   assert.equal(result.details.failure?.recoverable, true);
   assert.equal(turnState.fastModeExhausted, true);
+});
+
+void test("runCodexCommand does not spawn Codex for an already cancelled search", {
+  skip: process.platform === "win32",
+}, async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-codex-web-search-pre-aborted-"));
+  const marker = join(dir, "spawned");
+  const script = join(dir, "codex");
+  await writeFile(script, `#!/bin/sh\ntouch '${marker}'\n`, { mode: 0o755 });
+
+  const previousEnv = process.env.PI_CODEX_WEB_SEARCH_CODEX_PATH;
+  try {
+    const controller = new AbortController();
+    controller.abort(new Error("cancelled before start"));
+
+    // A missing binary used to emit an unhandled "error" (ENOENT) after the
+    // early rejection, crashing the host process.
+    process.env.PI_CODEX_WEB_SEARCH_CODEX_PATH = join(dir, "missing-codex");
+    await assert.rejects(
+      runCodexCommand({ args: [], cwd: dir, signal: controller.signal }),
+      /cancelled before start/
+    );
+
+    process.env.PI_CODEX_WEB_SEARCH_CODEX_PATH = script;
+    await assert.rejects(
+      runCodexCommand({ args: [], cwd: dir, signal: controller.signal }),
+      /cancelled before start/
+    );
+
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    await assert.rejects(stat(marker), { code: "ENOENT" });
+  } finally {
+    if (previousEnv === undefined) {
+      delete process.env.PI_CODEX_WEB_SEARCH_CODEX_PATH;
+    } else {
+      process.env.PI_CODEX_WEB_SEARCH_CODEX_PATH = previousEnv;
+    }
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+void test("runDefuddleCommand rejects an already cancelled extraction without fetching", async () => {
+  const controller = new AbortController();
+  controller.abort(new Error("cancelled before extraction"));
+  await assert.rejects(
+    runDefuddleCommand({
+      url: "https://example.com/",
+      cwd: process.cwd(),
+      signal: controller.signal,
+    }),
+    /cancelled before extraction/
+  );
 });
 
 void test("runCodexCommand survives Codex exiting before it reads the prompt", {

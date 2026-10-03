@@ -1,7 +1,7 @@
 import { spawn } from "node:child_process";
 import { createRequire } from "node:module";
 import { dirname, join } from "node:path";
-import { appendBounded } from "./codex-command.js";
+import { appendBounded, toCancellationError } from "./codex-command.js";
 import { DEFUDDLE_TIMEOUT_MS } from "./constants.js";
 import { type DefuddleParseResult, type RunDefuddleCommandOptions } from "./types.js";
 
@@ -111,6 +111,11 @@ export async function runDefuddleCommand(
   const cliPath = resolveDefuddleCliPath();
 
   return new Promise<DefuddleParseResult>((resolve, reject) => {
+    if (options.signal?.aborted) {
+      reject(toCancellationError(options.signal.reason, "Defuddle extraction was cancelled."));
+      return;
+    }
+
     const child = spawn(process.execPath, [cliPath, "parse", options.url, "--markdown", "--json"], {
       cwd: options.cwd,
       stdio: ["ignore", "pipe", "pipe"],
@@ -132,18 +137,12 @@ export async function runDefuddleCommand(
 
     const onAbort = (): void => {
       child.kill("SIGTERM");
-      const reason: unknown = options.signal?.reason;
-      const error =
-        reason instanceof Error
-          ? reason
-          : new Error(typeof reason === "string" ? reason : "Defuddle extraction was cancelled.");
+      const error = toCancellationError(
+        options.signal?.reason,
+        "Defuddle extraction was cancelled."
+      );
       finish(() => reject(error));
     };
-
-    if (options.signal?.aborted) {
-      onAbort();
-      return;
-    }
 
     const timeoutMs = options.timeoutMs ?? DEFUDDLE_TIMEOUT_MS;
     timeoutId = setTimeout(() => {
