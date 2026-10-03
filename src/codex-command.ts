@@ -36,6 +36,8 @@ export function appendBounded(buffer: string, chunk: string, maxBytes: number): 
   return combined.slice(combined.length - maxBytes);
 }
 
+// A Codex binary auto-detected in a common install location. Only paths from
+// cwd-independent roots are ever cached, and only after they spawned.
 let cachedBundledCodexPath: string | undefined;
 
 class CodexCommandNotFoundError extends Error {
@@ -45,50 +47,84 @@ class CodexCommandNotFoundError extends Error {
   }
 }
 
+/**
+ * Runs Codex, resolved in this order: explicit env overrides, `codex` on
+ * PATH, then a binary auto-detected in a common npm install location. The
+ * workspace's own node_modules is never searched: a repository opened in Pi
+ * must not be able to supply the binary that runs.
+ */
 export async function runCodexCommand(
   options: RunCodexCommandOptions
 ): Promise<RunCodexCommandResult> {
-  const candidates = await getCodexCommandCandidates(options.cwd);
+  const tried: string[] = [];
 
-  for (const command of candidates) {
-    try {
-      const result = await spawnCodexCommand(command, options);
-      if (command !== "codex") {
-        cachedBundledCodexPath = command;
-      }
+  for (const command of getConfiguredCodexCommands()) {
+    const result = await trySpawnCodexCommand(command, options);
+    if (result) {
       return result;
-    } catch (error) {
-      if (error instanceof CodexCommandNotFoundError) {
-        continue;
-      }
-      throw error;
+    }
+    tried.push(command);
+    if (command === cachedBundledCodexPath) {
+      cachedBundledCodexPath = undefined;
     }
   }
 
-  const tried = candidates.filter((candidate) => candidate !== "codex");
+  const bundledCodex = await findBundledCodexExecutable();
+  if (bundledCodex && !tried.includes(bundledCodex)) {
+    const result = await trySpawnCodexCommand(bundledCodex, options);
+    if (result) {
+      cachedBundledCodexPath = bundledCodex;
+      return result;
+    }
+    tried.push(bundledCodex);
+  }
+
+  const checked = tried.filter((candidate) => candidate !== "codex");
   const triedMessage =
-    tried.length > 0 ? ` Checked: ${tried.map((path) => `\`${path}\``).join(", ")}.` : "";
+    checked.length > 0 ? ` Checked: ${checked.map((path) => `\`${path}\``).join(", ")}.` : "";
 
   throw new Error(
     `Could not find \`codex\` in PATH or common install locations.${triedMessage} Install Codex CLI, then run \`codex login status\` or \`codex login\`.`
   );
 }
 
-export async function findBundledCodexExecutable(cwd?: string): Promise<string | undefined> {
-  if (cachedBundledCodexPath && (await isExecutableFile(cachedBundledCodexPath))) {
-    return cachedBundledCodexPath;
+async function trySpawnCodexCommand(
+  command: string,
+  options: RunCodexCommandOptions
+): Promise<RunCodexCommandResult | undefined> {
+  try {
+    return await spawnCodexCommand(command, options);
+  } catch (error) {
+    if (error instanceof CodexCommandNotFoundError) {
+      return undefined;
+    }
+    throw error;
   }
+}
 
-  for (const root of getCodexPackageRoots(cwd)) {
+function getConfiguredCodexCommands(): string[] {
+  return [
+    ...new Set([
+      ...CODEX_COMMAND_ENV_KEYS.map((key) => process.env[key]?.trim()).filter(
+        (value): value is string => !!value
+      ),
+      "codex",
+      ...(cachedBundledCodexPath ? [cachedBundledCodexPath] : []),
+    ]),
+  ];
+}
+
+export async function findBundledCodexExecutable(
+  roots: readonly string[] = getCodexPackageRoots()
+): Promise<string | undefined> {
+  for (const root of roots) {
     for (const packageName of await readDirectoryNames(root)) {
       if (!packageName.startsWith("codex")) {
         continue;
       }
 
-      const packageDir = join(root, packageName);
-      const directCandidate = await findCodexBinaryInPackage(packageDir);
+      const directCandidate = await findCodexBinaryInPackage(join(root, packageName));
       if (directCandidate) {
-        cachedBundledCodexPath = directCandidate;
         return directCandidate;
       }
     }
@@ -97,28 +133,10 @@ export async function findBundledCodexExecutable(cwd?: string): Promise<string |
   return undefined;
 }
 
-async function getCodexCommandCandidates(cwd: string): Promise<string[]> {
-  const candidates = [
-    ...CODEX_COMMAND_ENV_KEYS.map((key) => process.env[key]?.trim()).filter(
-      (value): value is string => !!value
-    ),
-    ...(cachedBundledCodexPath ? [cachedBundledCodexPath] : []),
-    "codex",
-  ];
-
-  const bundledCodex = await findBundledCodexExecutable(cwd);
-  if (bundledCodex) {
-    candidates.push(bundledCodex);
-  }
-
-  return [...new Set(candidates)];
-}
-
-function getCodexPackageRoots(cwd?: string): string[] {
+function getCodexPackageRoots(): string[] {
   const prefix = process.env.npm_config_prefix?.trim();
 
   return [
-    cwd ? join(resolve(cwd), "node_modules", "@openai") : undefined,
     ...PACKAGE_ROOTS,
     prefix ? join(resolve(prefix), "lib", "node_modules", "@openai") : undefined,
     join(dirname(process.execPath), "..", "lib", "node_modules", "@openai"),
