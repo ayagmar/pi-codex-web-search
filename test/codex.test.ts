@@ -2100,3 +2100,32 @@ void test("executeCodexWebSearch treats a dead-connection startup timeout as a t
   assert.equal(result.details.failure?.recoverable, true);
   assert.equal(turnState.fastModeExhausted, true);
 });
+
+void test("runCodexCommand survives Codex exiting before it reads the prompt", {
+  skip: process.platform === "win32",
+}, async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-codex-web-search-epipe-"));
+  const script = join(dir, "codex");
+  // Exit without reading stdin, so writing a large prompt hits a closed pipe (EPIPE).
+  await writeFile(script, "#!/bin/sh\necho 'config error' >&2\nexit 3\n", { mode: 0o755 });
+
+  const previousEnv = process.env.PI_CODEX_WEB_SEARCH_CODEX_PATH;
+  process.env.PI_CODEX_WEB_SEARCH_CODEX_PATH = script;
+  try {
+    const result = await runCodexCommand({
+      args: [],
+      cwd: dir,
+      stdin: "x".repeat(4 * 1024 * 1024),
+    });
+
+    assert.equal(result.code, 3);
+    assert.match(result.stderr, /config error/);
+  } finally {
+    if (previousEnv === undefined) {
+      delete process.env.PI_CODEX_WEB_SEARCH_CODEX_PATH;
+    } else {
+      process.env.PI_CODEX_WEB_SEARCH_CODEX_PATH = previousEnv;
+    }
+    await rm(dir, { recursive: true, force: true });
+  }
+});

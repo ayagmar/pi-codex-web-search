@@ -296,6 +296,12 @@ function spawnCodexCommand(
       finish(() => resolve({ code: code ?? 1, stdout, stderr }));
     });
 
+    // Codex can exit (bad config, auth failure, cancellation) before reading
+    // the prompt; the resulting EPIPE on stdin would otherwise be an uncaught
+    // error in the Pi process. The exit code and stderr already report the
+    // failure through the "close" handler.
+    child.stdin.on("error", () => {});
+
     if (options.stdin !== undefined) {
       child.stdin.end(options.stdin);
     } else {
