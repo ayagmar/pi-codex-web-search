@@ -3,7 +3,7 @@ import { createRequire } from "node:module";
 import { dirname, join } from "node:path";
 import { appendBounded } from "./codex-command.js";
 import { DEFUDDLE_TIMEOUT_MS } from "./constants.js";
-import type { DefuddleParseResult, RunDefuddleCommandOptions } from "./types.js";
+import { type DefuddleParseResult, type RunDefuddleCommandOptions } from "./types.js";
 
 const require = createRequire(import.meta.url);
 const DEFUDDLE_URL_PREFIX = "https://defuddle.md/";

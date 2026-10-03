@@ -1,7 +1,6 @@
-import test from "node:test";
 import assert from "node:assert/strict";
-import { buildSearchKey, createSearchGate } from "../src/search-gate.js";
-import type { SearchGateResult } from "../src/search-gate.js";
+import test from "node:test";
+import { buildSearchKey, createSearchGate, type SearchGateResult } from "../src/search-gate.js";
 
 function successResult(text: string): SearchGateResult {
   return {

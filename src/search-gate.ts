@@ -1,4 +1,4 @@
-import type { SearchFreshness, SearchMode } from "./types.js";
+import { type SearchFreshness, type SearchMode } from "./types.js";
 
 export interface SearchGateParams {
   query: string;

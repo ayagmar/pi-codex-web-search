@@ -1,13 +1,14 @@
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import {
   DEFAULT_MAX_BYTES,
   DEFAULT_MAX_LINES,
   formatSize,
   truncateHead,
 } from "@earendil-works/pi-coding-agent";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { fileURLToPath } from "node:url";
+import { runCodexCommand } from "./codex-command.js";
 import {
   MAX_ALLOWED_SOURCES,
   STALL_INACTIVITY_TIMEOUT_MS,
@@ -20,26 +21,25 @@ import {
   getDirectUrlQuery,
   runDefuddleCommand,
 } from "./defuddle.js";
-import { runCodexCommand } from "./codex-command.js";
 import { DEFAULT_WEB_SEARCH_SETTINGS } from "./settings.js";
-import type {
-  CodexFailureDetails,
-  CodexFailureKind,
-  CodexWebSearchDetails,
-  CodexWebSearchOutput,
-  DefuddleParseResult,
-  ExecuteCodexWebSearchOptions,
-  RetryProvenance,
-  RunCodexCommand,
-  RunCodexCommandOptions,
-  RunCodexCommandResult,
-  SearchFreshness,
-  SearchMode,
-  WebSearchInput,
-  WebSearchProgressDetails,
-  WebSearchSettings,
-  WebSearchSource,
-  WebSearchTurnState,
+import {
+  type CodexFailureDetails,
+  type CodexFailureKind,
+  type CodexWebSearchDetails,
+  type CodexWebSearchOutput,
+  type DefuddleParseResult,
+  type ExecuteCodexWebSearchOptions,
+  type RetryProvenance,
+  type RunCodexCommand,
+  type RunCodexCommandOptions,
+  type RunCodexCommandResult,
+  type SearchFreshness,
+  type SearchMode,
+  type WebSearchInput,
+  type WebSearchProgressDetails,
+  type WebSearchSettings,
+  type WebSearchSource,
+  type WebSearchTurnState,
 } from "./types.js";
 
 const SEARCH_OUTPUT_SCHEMA_PATH = fileURLToPath(
@@ -297,9 +297,9 @@ export function buildCodexExecArgs(
     "exec",
     "--json",
     "-c",
-    `web_search=\"${freshness}\"`,
+    `web_search="${freshness}"`,
     "-c",
-    `model_reasoning_effort=\"${mode === "fast" ? "low" : "medium"}\"`,
+    `model_reasoning_effort="${mode === "fast" ? "low" : "medium"}"`,
     "--skip-git-repo-check",
     "--sandbox",
     "read-only",
@@ -840,7 +840,6 @@ async function maybeRunDefuddleSearch(
       if (options.signal?.aborted || isAbortLikeError(error)) {
         throw error;
       }
-      continue;
     }
   }
 
@@ -1483,7 +1482,8 @@ function recordSearchCall(
 ): void {
   const item = extractEventItem(event);
   const itemId = typeof item?.id === "string" ? item.id : undefined;
-  const recordedIds = progress.searchCallIds ?? (progress.searchCallIds = []);
+  progress.searchCallIds ??= [];
+  const recordedIds = progress.searchCallIds;
 
   if (itemId) {
     if (recordedIds.includes(itemId)) {
@@ -1504,7 +1504,8 @@ function collectPageActions(
     return [];
   }
 
-  const recordedPageActions = progress.pageActions ?? (progress.pageActions = []);
+  progress.pageActions ??= [];
+  const recordedPageActions = progress.pageActions;
   const addedPageActions: string[] = [];
   for (const pageAction of pageActions) {
     const normalized = pageAction.trim();

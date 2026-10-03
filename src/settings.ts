@@ -15,7 +15,12 @@ import {
   MIN_QUERY_BUDGET,
   MIN_TIMEOUT_MS,
 } from "./constants.js";
-import type { DefuddleMode, SearchFreshness, SearchMode, WebSearchSettings } from "./types.js";
+import {
+  type DefuddleMode,
+  type SearchFreshness,
+  type SearchMode,
+  type WebSearchSettings,
+} from "./types.js";
 
 export const DEFAULT_WEB_SEARCH_SETTINGS: WebSearchSettings = {
   defaultMode: "fast",
