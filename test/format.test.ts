@@ -25,3 +25,10 @@ void test("formatInlineQuery truncates by terminal width", () => {
   // No ANSI reset is inserted before the ellipsis, so outer colors survive.
   assert.ok(!wide.includes("\u001b"));
 });
+
+void test("formatInlineQuery keeps multi-line text on one line", () => {
+  assert.equal(
+    formatInlineQuery("codex exec failed with exit code 1.\n\nstream disconnected\n\t retrying"),
+    "codex exec failed with exit code 1. stream disconnected retrying"
+  );
+});
