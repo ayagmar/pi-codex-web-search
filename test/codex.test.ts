@@ -621,6 +621,25 @@ void test("executeCodexWebSearch uses Defuddle directly for URL-only queries", a
   assert.match(result.content[0]?.text ?? "", /Codex supports workflows beyond chat\./);
 });
 
+void test("executeCodexWebSearch forwards the caller's cancellation to the Codex run", async () => {
+  const controller = new AbortController();
+  const runner: RunCodexCommand = ({ signal }) =>
+    new Promise((_resolve, reject) => {
+      assert.ok(signal);
+      assert.notEqual(signal, controller.signal);
+      signal.addEventListener("abort", () => reject(signal.reason as Error), { once: true });
+      setTimeout(() => controller.abort(new Error("search cancelled by the user")), 10);
+    });
+
+  await assert.rejects(
+    executeCodexWebSearch(
+      { query: "cancel me", mode: "deep" },
+      { cwd: process.cwd(), runner, signal: controller.signal }
+    ),
+    /search cancelled by the user/
+  );
+});
+
 void test("executeCodexWebSearch rethrows Defuddle cancellations", async () => {
   const abortController = new AbortController();
   const abortError = new DOMException("Aborted", "AbortError");
