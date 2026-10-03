@@ -147,7 +147,7 @@ Behavior:
 - returns a compact answer with sources
 - truncates oversized output and saves the full result to a temp file when needed
 - surfaces clearer Codex auth guidance, including `codex login status` and `codex login`, when authentication appears to be missing or expired
-- soft-degrades recoverable Codex failures so Pi can keep going, while still failing clearly for missing `codex`, bad local config, cancellations, and auth problems
+- soft-degrades recoverable Codex failures (timeouts, transport errors, rate limits, budgets, empty or invalid output) so Pi can keep going: the result still carries the failure details for the UI, but is flagged as a tool error so the model and `tool_result` hooks see the call failed. Missing `codex`, bad local config, cancellations, and auth problems still fail outright
 
 ## Settings
 
