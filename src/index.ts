@@ -21,7 +21,9 @@ import {
   DEFAULT_WEB_SEARCH_SETTINGS,
   formatSettings,
   loadSettings,
+  loadSettingsStrict,
   saveSettings,
+  updateSettings,
 } from "./settings.js";
 import {
   type CodexFailureDetails,
@@ -311,7 +313,7 @@ export default function codexWebSearchExtension(pi: ExtensionAPI) {
           await openSettingsDialog(ctx);
           return;
         }
-        notify(ctx, buildSettingsHelp(await loadSettings()));
+        await handleSettingsCommand("status", ctx);
         return;
       }
 
@@ -321,15 +323,10 @@ export default function codexWebSearchExtension(pi: ExtensionAPI) {
 }
 
 async function handleSettingsCommand(args: string, ctx: ExtensionCommandContext): Promise<void> {
-  const settings = await loadSettings();
   const [command, value] = splitArgs(args);
 
   try {
     switch (command) {
-      case "status":
-        notify(ctx, buildSettingsHelp(settings));
-        return;
-
       case "reset": {
         const saved = await saveSettings(DEFAULT_WEB_SEARCH_SETTINGS);
         notify(ctx, `Web search settings reset.\n\n${formatSettings(saved)}`);
@@ -337,44 +334,40 @@ async function handleSettingsCommand(args: string, ctx: ExtensionCommandContext)
       }
 
       case "default-mode": {
-        const mode = parseMode(value);
-        const saved = await saveSettings({ ...settings, defaultMode: mode });
+        const saved = await updateSettings({ defaultMode: parseMode(value) });
         notify(ctx, `Default mode updated to ${saved.defaultMode}.`);
         return;
       }
 
       case "fast-freshness": {
-        const freshness = parseFreshness(value);
-        const saved = await saveSettings({ ...settings, fastFreshness: freshness });
+        const saved = await updateSettings({ fastFreshness: parseFreshness(value) });
         notify(ctx, `Fast freshness updated to ${saved.fastFreshness}.`);
         return;
       }
 
       case "deep-freshness": {
-        const freshness = parseFreshness(value);
-        const saved = await saveSettings({ ...settings, deepFreshness: freshness });
+        const saved = await updateSettings({ deepFreshness: parseFreshness(value) });
         notify(ctx, `Deep freshness updated to ${saved.deepFreshness}.`);
         return;
       }
 
       case "fast-max-sources": {
         const fastMaxSources = parseInteger(value, 1, MAX_ALLOWED_SOURCES, "fast max sources");
-        const saved = await saveSettings({ ...settings, fastMaxSources });
+        const saved = await updateSettings({ fastMaxSources });
         notify(ctx, `Fast max sources updated to ${saved.fastMaxSources}.`);
         return;
       }
 
       case "deep-max-sources": {
         const deepMaxSources = parseInteger(value, 1, MAX_ALLOWED_SOURCES, "deep max sources");
-        const saved = await saveSettings({ ...settings, deepMaxSources });
+        const saved = await updateSettings({ deepMaxSources });
         notify(ctx, `Deep max sources updated to ${saved.deepMaxSources}.`);
         return;
       }
 
       case "default-max-sources": {
         const maxSources = parseInteger(value, 1, MAX_ALLOWED_SOURCES, "default max sources");
-        const saved = await saveSettings({
-          ...settings,
+        const saved = await updateSettings({
           fastMaxSources: maxSources,
           deepMaxSources: maxSources,
         });
@@ -383,58 +376,80 @@ async function handleSettingsCommand(args: string, ctx: ExtensionCommandContext)
       }
 
       case "defuddle-mode": {
-        const defuddleMode = parseDefuddleMode(value);
-        const saved = await saveSettings({ ...settings, defuddleMode });
+        const saved = await updateSettings({ defuddleMode: parseDefuddleMode(value) });
         notify(ctx, `Defuddle mode updated to ${saved.defuddleMode}.`);
         return;
       }
 
       case "fast-timeout-ms": {
-        const fastTimeoutMs = parseTimeoutMs(value, "fast timeout");
-        const saved = await saveSettings({ ...settings, fastTimeoutMs });
+        const saved = await updateSettings({
+          fastTimeoutMs: parseTimeoutMs(value, "fast timeout"),
+        });
         notify(ctx, `Fast timeout updated to ${saved.fastTimeoutMs} ms.`);
         return;
       }
 
       case "deep-timeout-ms": {
-        const deepTimeoutMs = parseTimeoutMs(value, "deep timeout");
-        const saved = await saveSettings({ ...settings, deepTimeoutMs });
+        const saved = await updateSettings({
+          deepTimeoutMs: parseTimeoutMs(value, "deep timeout"),
+        });
         notify(ctx, `Deep timeout updated to ${saved.deepTimeoutMs} ms.`);
         return;
       }
 
       case "defuddle-timeout-ms": {
-        const defuddleTimeoutMs = parseTimeoutMs(value, "Defuddle timeout");
-        const saved = await saveSettings({ ...settings, defuddleTimeoutMs });
+        const saved = await updateSettings({
+          defuddleTimeoutMs: parseTimeoutMs(value, "Defuddle timeout"),
+        });
         notify(ctx, `Defuddle timeout updated to ${saved.defuddleTimeoutMs} ms.`);
         return;
       }
 
       case "fast-query-budget": {
-        const fastQueryBudget = parseQueryBudget(value, "fast query budget");
-        const saved = await saveSettings({ ...settings, fastQueryBudget });
+        const saved = await updateSettings({
+          fastQueryBudget: parseQueryBudget(value, "fast query budget"),
+        });
         notify(ctx, `Fast search-call budget updated to ${saved.fastQueryBudget}.`);
         return;
       }
 
       case "deep-query-budget": {
-        const deepQueryBudget = parseQueryBudget(value, "deep query budget");
-        const saved = await saveSettings({ ...settings, deepQueryBudget });
+        const saved = await updateSettings({
+          deepQueryBudget: parseQueryBudget(value, "deep query budget"),
+        });
         notify(ctx, `Deep search-call budget updated to ${saved.deepQueryBudget}.`);
         return;
       }
 
       default:
-        notify(ctx, buildSettingsHelp(settings));
+        // "status" and unknown subcommands show the current settings and help.
+        notify(ctx, buildSettingsHelp(await loadSettingsStrict()));
     }
   } catch (error) {
     notify(ctx, error instanceof Error ? error.message : String(error), "error");
   }
 }
 
+/**
+ * Loads the settings shown by the dialogs. A settings file with invalid JSON
+ * is reported and closes the dialog instead of showing (and later saving)
+ * defaults over the user's values.
+ */
+async function loadDialogSettings(
+  ctx: ExtensionCommandContext
+): Promise<WebSearchSettings | undefined> {
+  try {
+    return await loadSettingsStrict();
+  } catch (error) {
+    notify(ctx, error instanceof Error ? error.message : String(error), "error");
+    return undefined;
+  }
+}
+
 async function openSettingsDialog(ctx: ExtensionCommandContext): Promise<void> {
   while (true) {
-    const settings = await loadSettings();
+    const settings = await loadDialogSettings(ctx);
+    if (!settings) return;
     const choice = await ctx.ui.select(
       "Web search settings\nChoose a group. Saved values apply when the tool call omits overrides.",
       [
@@ -482,7 +497,8 @@ async function openSettingsDialog(ctx: ExtensionCommandContext): Promise<void> {
 
 async function openSearchDefaultsDialog(ctx: ExtensionCommandContext): Promise<void> {
   while (true) {
-    const settings = await loadSettings();
+    const settings = await loadDialogSettings(ctx);
+    if (!settings) return;
     const choice = await ctx.ui.select(
       "Search defaults\nUsed when the tool call omits mode, freshness, or maxSources.",
       [
@@ -558,7 +574,8 @@ async function openSearchDefaultsDialog(ctx: ExtensionCommandContext): Promise<v
 
 async function openDefuddleSettingsDialog(ctx: ExtensionCommandContext): Promise<void> {
   while (true) {
-    const settings = await loadSettings();
+    const settings = await loadDialogSettings(ctx);
+    if (!settings) return;
     const choice = await ctx.ui.select(
       "Defuddle behavior\nControls direct URL extraction and optional single-URL fallback after Codex fails.",
       [`Mode → ${settings.defuddleMode}`, "Back"]
@@ -591,7 +608,8 @@ async function openDefuddleSettingsDialog(ctx: ExtensionCommandContext): Promise
 
 async function openTimeoutSettingsDialog(ctx: ExtensionCommandContext): Promise<void> {
   while (true) {
-    const settings = await loadSettings();
+    const settings = await loadDialogSettings(ctx);
+    if (!settings) return;
     const choice = await ctx.ui.select(
       "Timeouts\nHow long each backend gets before the run is cancelled.",
       [
@@ -635,7 +653,8 @@ async function openTimeoutSettingsDialog(ctx: ExtensionCommandContext): Promise<
 
 async function openQueryBudgetSettingsDialog(ctx: ExtensionCommandContext): Promise<void> {
   while (true) {
-    const settings = await loadSettings();
+    const settings = await loadDialogSettings(ctx);
+    if (!settings) return;
     const choice = await ctx.ui.select(
       "Search-call budgets\nLimits how many web_search tool calls Codex can issue per run. Batched query strings count as one call.",
       [

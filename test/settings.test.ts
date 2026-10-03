@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -7,9 +7,12 @@ import {
   DEFAULT_WEB_SEARCH_SETTINGS,
   formatSettings,
   getSettingsPath,
+  InvalidSettingsFileError,
   loadSettings,
+  loadSettingsStrict,
   normalizeSettings,
   saveSettings,
+  updateSettings,
 } from "../src/settings.js";
 
 void test("normalizeSettings fills invalid values with defaults", () => {
@@ -129,4 +132,38 @@ void test("settings are stored in the Pi agent directory from PI_CODING_AGENT_DI
   const raw = JSON.parse(await readFile(join(dir, "pi-codex-web-search.settings.json"), "utf-8"));
   assert.equal(raw.defaultMode, "deep");
   assert.equal((await loadSettings()).defaultMode, "deep");
+});
+
+void test("a settings file with invalid JSON falls back to defaults for searches only", async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-codex-web-search-settings-"));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const path = join(dir, "settings.json");
+  const broken = '{ "defaultMode": "deep", "fastMaxSources": 9, }\n';
+  await writeFile(path, broken, "utf-8");
+
+  assert.deepEqual(await loadSettings(path), DEFAULT_WEB_SEARCH_SETTINGS);
+  await assert.rejects(loadSettingsStrict(path), InvalidSettingsFileError);
+  // Editing one value must not replace the user's other values with defaults.
+  await assert.rejects(updateSettings({ deepMaxSources: 3 }, path), /not valid JSON/);
+  assert.equal(await readFile(path, "utf-8"), broken);
+});
+
+void test("updateSettings merges concurrent changes and leaves no temp files", async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-codex-web-search-settings-"));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const path = join(dir, "settings.json");
+
+  await Promise.all([
+    updateSettings({ defaultMode: "deep" }, path),
+    updateSettings({ fastMaxSources: 2 }, path),
+    updateSettings({ deepQueryBudget: 40 }, path),
+  ]);
+
+  assert.deepEqual(await loadSettingsStrict(path), {
+    ...DEFAULT_WEB_SEARCH_SETTINGS,
+    defaultMode: "deep",
+    fastMaxSources: 2,
+    deepQueryBudget: 40,
+  });
+  assert.deepEqual(await readdir(dir), ["settings.json"]);
 });
