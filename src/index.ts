@@ -161,7 +161,7 @@ export default function codexWebSearchExtension(pi: ExtensionAPI) {
       }
       return new Text(text, 0, 0);
     },
-    renderResult(result, { expanded, isPartial }, theme) {
+    renderResult(result, { expanded, isPartial }, theme, context) {
       if (isPartial) {
         const details = result.details as WebSearchProgressDetails | undefined;
         return new Text(renderProgress(details, expanded, theme), 0, 0);
@@ -171,15 +171,20 @@ export default function codexWebSearchExtension(pi: ExtensionAPI) {
         | (Partial<CodexWebSearchDetails> & {
             servedFromTurnCache?: boolean;
             coalescedWithToolCallId?: string;
+            concurrentSearchSkipped?: boolean;
           })
         | undefined;
       if (!hasRenderableResultDetails(details)) {
         const content = result.content.find((part) => part.type === "text");
         const text = content?.type === "text" ? content.text : "";
-        const failed = looksLikeFailureText(text);
-        const statusLine = failed
-          ? theme.fg("warning", "⚠ Web search failed")
-          : theme.fg("success", "✓ Web search finished");
+        let statusLine: string;
+        if (details?.concurrentSearchSkipped) {
+          statusLine = theme.fg("warning", "⚠ Web search skipped: another web_search was running");
+        } else if (context?.isError || looksLikeFailureText(text)) {
+          statusLine = theme.fg("warning", "⚠ Web search failed");
+        } else {
+          statusLine = theme.fg("success", "✓ Web search finished");
+        }
 
         if (text && expanded) {
           return new Text(`${statusLine}\n\n${formatToolOutput(text, theme)}`, 0, 0);

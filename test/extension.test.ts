@@ -20,6 +20,13 @@ type CapturedToolExecute = (
   context: { cwd: string }
 ) => Promise<CapturedToolResult>;
 
+type CapturedRenderResult = (
+  result: CapturedToolResult,
+  options: { expanded: boolean; isPartial: boolean },
+  theme: unknown,
+  context: { isError: boolean }
+) => { render: (width: number) => string[] };
+
 type CapturedCommandHandler = (args: string, ctx: unknown) => Promise<void>;
 
 interface CapturedExtension {
@@ -28,6 +35,7 @@ interface CapturedExtension {
   toolPromptSnippet?: string;
   toolPromptGuidelines?: string[];
   toolExecute?: CapturedToolExecute;
+  toolRenderResult?: CapturedRenderResult;
   commandName?: string;
   commandDescription?: string;
   commandHandler?: CapturedCommandHandler;
@@ -55,7 +63,9 @@ function createMockPi(captured: CapturedExtension): ExtensionAPI {
       promptSnippet?: string;
       promptGuidelines?: string[];
       execute: CapturedToolExecute;
+      renderResult: CapturedRenderResult;
     }) => {
+      captured.toolRenderResult = tool.renderResult;
       captured.toolName = tool.name;
       captured.toolDescription = tool.description;
       if (tool.promptSnippet !== undefined) captured.toolPromptSnippet = tool.promptSnippet;
@@ -337,4 +347,36 @@ void test("settings commands refuse to overwrite a settings file with invalid JS
   await handler("reset", ctx);
   assert.equal(notifications.at(-1)?.level, "info");
   assert.equal(JSON.parse(await readFile(settingsPath, "utf-8")).fastMaxSources, 5);
+});
+
+void test("a skipped concurrent search renders as skipped, not failed", () => {
+  const captured: CapturedExtension = {};
+  codexWebSearchExtension(createMockPi(captured));
+  const renderResult = captured.toolRenderResult;
+  assert.ok(renderResult);
+  const theme = { fg: (_color: string, text: string) => text, bold: (text: string) => text };
+  const render = (result: CapturedToolResult, isError = false) =>
+    renderResult(result, { expanded: false, isPartial: false }, theme, { isError })
+      .render(200)
+      .join("\n");
+
+  const skipped = render({
+    content: [
+      {
+        type: "text",
+        text: "Skipped this concurrent web search because another web_search call is already running.",
+      },
+    ],
+    details: {
+      concurrentSearchSkipped: true,
+      activeToolCallId: "a",
+      activeQuery: "x",
+      skippedQuery: "y",
+    },
+  });
+  assert.match(skipped, /Web search skipped/);
+  assert.doesNotMatch(skipped, /failed/);
+
+  const thrown = render({ content: [{ type: "text", text: "Codex says no" }] }, true);
+  assert.match(thrown, /Web search failed/);
 });
