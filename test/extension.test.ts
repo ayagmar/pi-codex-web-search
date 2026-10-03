@@ -26,11 +26,24 @@ interface CapturedExtension {
   toolExecute?: CapturedToolExecute;
   commandName?: string;
   commandDescription?: string;
+  handlers?: Map<string, ((event: unknown, ctx: unknown) => unknown)[]>;
+}
+
+async function emit(captured: CapturedExtension, event: string, payload: object): Promise<void> {
+  for (const handler of captured.handlers?.get(event) ?? []) {
+    await handler({ type: event, ...payload }, {});
+  }
 }
 
 function createMockPi(captured: CapturedExtension): ExtensionAPI {
   return {
-    on: () => undefined,
+    on: (event: string, handler: (event: unknown, ctx: unknown) => unknown) => {
+      captured.handlers ??= new Map();
+      const handlers = captured.handlers.get(event) ?? [];
+      handlers.push(handler);
+      captured.handlers.set(event, handlers);
+      return () => undefined;
+    },
     registerTool: (tool: { name: string; description: string; execute: CapturedToolExecute }) => {
       captured.toolName = tool.name;
       captured.toolDescription = tool.description;
@@ -168,4 +181,31 @@ void test("a skipped sibling call does not steal the running search's signal or 
 
   await assert.rejects(first, /cancelled/);
   assert.equal(siblingUpdates.length, 0);
+});
+
+void test("session_shutdown cancels an in-flight search", {
+  skip: process.platform === "win32",
+}, async (t) => {
+  const fake = await installHangingCodex();
+  t.after(fake.restore);
+
+  const captured: CapturedExtension = {};
+  codexWebSearchExtension(createMockPi(captured));
+  assert.ok(captured.toolExecute);
+
+  const updates: unknown[] = [];
+  const search = captured.toolExecute(
+    "search-1",
+    { query: "long running question" },
+    new AbortController().signal,
+    (update) => updates.push(update),
+    { cwd: fake.dir }
+  );
+
+  await waitFor(() => updates.length > 0);
+  await emit(captured, "session_shutdown", { reason: "quit" });
+  // Shutdown handlers must be idempotent.
+  await emit(captured, "session_shutdown", { reason: "quit" });
+
+  await assert.rejects(search, /session ended/);
 });
