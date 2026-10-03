@@ -2142,6 +2142,72 @@ void test("executeCodexWebSearch bounds the stdout tail kept in failure messages
   assert.ok((result.details.failure?.message.length ?? 0) < 5_000);
 });
 
+function verboseStderr(lastLine: string): string {
+  // 25 ordinary log lines of about 280 chars: their 20-line tail alone is
+  // longer than the failure message bound.
+  const logLine = `INFO codex_core::session: processing event ${"x".repeat(240)}`;
+  return [...Array.from({ length: 25 }, () => logLine), lastLine].join("\n");
+}
+
+void test("executeCodexWebSearch classifies a long stderr by its final error line", async () => {
+  const runner: RunCodexCommand = () =>
+    Promise.resolve({
+      code: 1,
+      stdout: "",
+      stderr: verboseStderr(
+        "ERROR codex_exec: unexpected status 401 Unauthorized: Missing bearer token"
+      ),
+    });
+
+  await assert.rejects(
+    executeCodexWebSearch(
+      { query: "verbose auth failure", mode: "deep" },
+      { cwd: process.cwd(), runner }
+    ),
+    (error: unknown) => {
+      const failure = (error as { failure?: { kind?: string; message?: string } }).failure;
+      assert.equal(failure?.kind, "auth");
+      assert.match(failure?.message ?? "", /401 Unauthorized/);
+      assert.ok((failure?.message?.length ?? 0) < 5_000);
+      return true;
+    }
+  );
+});
+
+void test("executeCodexWebSearch retries a long-stderr transport failure in deep/live mode", async () => {
+  let attempts = 0;
+  const runner: RunCodexCommand = ({ args }) => {
+    attempts += 1;
+    if (attempts === 1) {
+      return Promise.resolve({
+        code: 1,
+        stdout: "",
+        stderr: verboseStderr("ERROR codex_exec: stream disconnected before completion"),
+      });
+    }
+
+    const outputPath = args[args.indexOf("--output-last-message") + 1];
+    assert.ok(outputPath);
+    return writeFile(
+      outputPath,
+      JSON.stringify({ summary: "Recovered after a transport retry.", sources: [] })
+    ).then(() => ({ code: 0, stdout: "", stderr: "" }));
+  };
+
+  const result = await executeCodexWebSearch(
+    { query: "verbose transport failure" },
+    {
+      cwd: process.cwd(),
+      runner,
+      settings: { ...DEFAULT_WEB_SEARCH_SETTINGS, defuddleMode: "off" },
+    }
+  );
+
+  assert.equal(attempts, 2);
+  assert.equal(result.details.retry?.retriedFromFast, true);
+  assert.match(result.details.retry?.fallbackReason ?? "", /stream disconnected before completion/);
+});
+
 void test("executeCodexWebSearch treats a dead-connection startup timeout as a timeout, not an auth failure", async () => {
   const now = Date.now();
   const startupFailure = getInactivityFailure(

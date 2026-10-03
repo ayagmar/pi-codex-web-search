@@ -1163,23 +1163,31 @@ function shouldThrowCodexFailure(failure: CodexFailureDetails): boolean {
 function buildCodexFailure(result: RunCodexCommandResult): CodexFailureDetails {
   const stdoutSummary = summarizeCodexStdout(result.stdout);
   const headline = `codex exec failed with exit code ${result.code}.`;
-  const errorDetails = dedupeStrings(
-    [
-      stdoutSummary.turnFailedMessage,
-      stdoutSummary.errorMessages.at(-1),
-      tailLines(result.stderr, MAX_FAILURE_STDERR_LINES),
-    ].filter((detail): detail is string => !!detail)
-  ).map((detail) => boundFailureDetail(detail, MAX_FAILURE_ERROR_CHARS));
+  const stderrTail = tailLines(result.stderr, MAX_FAILURE_STDERR_LINES);
+  const errorSources = dedupeStrings(
+    [stdoutSummary.turnFailedMessage, stdoutSummary.errorMessages.at(-1), stderrTail].filter(
+      (detail): detail is string => !!detail
+    )
+  );
+  // Codex prints its fatal error last, so the stderr tail keeps its end when
+  // bounded; the single error messages keep their start.
+  const errorDetails = errorSources.map((detail) =>
+    detail === stderrTail
+      ? boundFailureTail(detail, MAX_FAILURE_ERROR_CHARS)
+      : boundFailureDetail(detail, MAX_FAILURE_ERROR_CHARS)
+  );
   const stdoutTail = tailLines(result.stdout, MAX_FAILURE_STDOUT_LINES)
     .split("\n")
     .map((line) => boundFailureDetail(line, MAX_FAILURE_LINE_CHARS))
     .join("\n");
   const message = [headline, ...errorDetails, stdoutTail].filter(Boolean).join("\n\n");
-  // Classify on what Codex reported as errors. The stdout tail is ordinary
-  // research activity (queries, URLs, answers) kept only for diagnostics: a
-  // query about a "login" page must not look like an auth failure.
+  // Classify on what Codex reported as errors, before any length bound so a
+  // long stderr tail cannot hide the final error line. The stdout tail is
+  // ordinary research activity (queries, URLs, answers) kept only for
+  // diagnostics: a query about a "login" page must not look like an auth
+  // failure.
   const classified = classifyFailureText(
-    errorDetails.length > 0 ? [headline, ...errorDetails].join("\n\n") : message
+    errorSources.length > 0 ? [headline, ...errorSources].join("\n\n") : message
   );
 
   if (classified.kind === "auth") {
@@ -1260,6 +1268,10 @@ const MAX_FAILURE_ERROR_CHARS = 4_000;
 
 function boundFailureDetail(text: string, maxChars: number): string {
   return truncateLine(text, maxChars).text;
+}
+
+function boundFailureTail(text: string, maxChars: number): string {
+  return text.length > maxChars ? `... [truncated]\n${text.slice(-maxChars)}` : text;
 }
 
 function tailLines(text: string, count: number): string {
