@@ -1,4 +1,4 @@
-import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, readFile, realpath, rename, rm, stat, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { getAgentDir, withFileMutationQueue } from "@earendil-works/pi-coding-agent";
 import {
@@ -131,13 +131,25 @@ async function writeSettingsFile(
   path: string
 ): Promise<WebSearchSettings> {
   const normalized = normalizeSettings(settings);
-  await mkdir(dirname(path), { recursive: true });
+  // Save through a symlink (dotfile managers such as stow or chezmoi) onto
+  // the file it points to, instead of replacing the link.
+  const target = await realpath(path).catch(() => path);
+  await mkdir(dirname(target), { recursive: true });
   // Write a sibling temp file and rename it into place, so a search that
   // reads the settings concurrently never sees a half-written file.
-  const tempPath = `${path}.${process.pid}.${Date.now()}.tmp`;
+  const tempPath = `${target}.${process.pid}.${Date.now()}.tmp`;
   try {
     await writeFile(tempPath, `${JSON.stringify(normalized, null, 2)}\n`, "utf-8");
-    await rename(tempPath, path);
+    // Keep the existing file's permissions (chmod, since umask applies to
+    // writeFile's mode option).
+    const mode = await stat(target).then(
+      (stats) => stats.mode & 0o777,
+      () => undefined
+    );
+    if (mode !== undefined) {
+      await chmod(tempPath, mode);
+    }
+    await rename(tempPath, target);
   } catch (error) {
     await rm(tempPath, { force: true });
     throw error;

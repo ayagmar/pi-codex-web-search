@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
+import { lstat, mkdtemp, readdir, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -166,4 +166,26 @@ void test("updateSettings merges concurrent changes and leaves no temp files", a
     deepQueryBudget: 40,
   });
   assert.deepEqual(await readdir(dir), ["settings.json"]);
+});
+
+void test("updateSettings saves through a symlink and keeps the target's mode", {
+  skip: process.platform === "win32",
+}, async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-codex-web-search-settings-"));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const target = join(dir, "dotfiles-settings.json");
+  const link = join(dir, "settings.json");
+  await writeFile(target, '{ "fastMaxSources": 7 }\n', { mode: 0o600 });
+  await symlink(target, link);
+
+  await updateSettings({ defaultMode: "deep" }, link);
+
+  assert.equal((await lstat(link)).isSymbolicLink(), true);
+  assert.deepEqual(await loadSettingsStrict(target), {
+    ...DEFAULT_WEB_SEARCH_SETTINGS,
+    defaultMode: "deep",
+    fastMaxSources: 7,
+  });
+  assert.equal((await stat(target)).mode & 0o777, 0o600);
+  assert.deepEqual((await readdir(dir)).sort(), ["dotfiles-settings.json", "settings.json"]);
 });
