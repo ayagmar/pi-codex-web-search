@@ -54,6 +54,8 @@ The extension then:
   - installed in a common npm location the extension can auto-detect, or
   - pointed to explicitly with `PI_CODEX_WEB_SEARCH_CODEX_PATH`
 
+  A Codex installed only in the opened project's `node_modules` is never used automatically; point to it with `PI_CODEX_WEB_SEARCH_CODEX_PATH` if that is the one you want.
+
 Check your Codex auth state with:
 
 ```bash
