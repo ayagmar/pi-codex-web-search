@@ -90,7 +90,7 @@ pi -e npm:pi-codex-web-search
 
 Update an installed copy with `pi update npm:pi-codex-web-search` (or `pi update --extensions`; a bare `pi update` only updates Pi itself).
 
-From a local checkout:
+From a local checkout (run `pnpm install` in the checkout first; pi does not install dependencies for local paths, and the `defuddle` runtime dependency must be present):
 
 ```bash
 pi install /absolute/path/to/pi-codex-web-search
