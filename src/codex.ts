@@ -632,7 +632,7 @@ async function runResolvedCodexWebSearch(
     try {
       runResult = await runner(runnerOptions);
     } catch (error) {
-      const failure = getCodexFailure(error);
+      const failure = getRunnerFailure(error, options.signal);
       if (mode === "fast" && shouldExhaustFastModeInTurn(failure)) {
         markFastModeExhausted(options.turnState);
       }
@@ -1142,6 +1142,26 @@ function getCodexFailure(error: unknown): CodexFailureDetails {
   return classifyFailureText(message);
 }
 
+// A runner rejection is the caller's cancellation when the caller's signal
+// fired, whatever the rejection says; that state, not the message text, marks
+// it as cancelled. Our own inactivity and budget aborts do not touch the
+// caller's signal and are classified by their messages.
+function getRunnerFailure(
+  error: unknown,
+  callerSignal: AbortSignal | undefined
+): CodexFailureDetails {
+  if (error instanceof CodexWebSearchFailure) {
+    return error.failure;
+  }
+
+  if (callerSignal?.aborted || isAbortLikeError(error)) {
+    const message = error instanceof Error ? error.message : String(error);
+    return createCodexFailure("cancelled", message, false);
+  }
+
+  return getCodexFailure(error);
+}
+
 function getFailureProgress(
   error: unknown,
   input: ResolvedWebSearchInput
@@ -1208,6 +1228,9 @@ function buildCodexFailure(result: RunCodexCommandResult): CodexFailureDetails {
   return createCodexFailure(classified.kind, message, classified.recoverable);
 }
 
+const NETWORK_FAILURE_PATTERN =
+  /connection (?:aborted|reset|refused|closed)|socket hang up|error sending request|stream disconnected/i;
+
 function classifyFailureText(message: string): CodexFailureDetails {
   if (/could not find `codex` in path|common install locations/i.test(message)) {
     return createCodexFailure("missing_cli", message, false);
@@ -1225,6 +1248,13 @@ function classifyFailureText(message: string): CodexFailureDetails {
 
   if (needsCodexAuthHelp(message)) {
     return createCodexFailure("auth", message, false);
+  }
+
+  // Network drops reported by Codex ("connection aborted", "error sending
+  // request ...") are transient, not a cancellation, even though they can
+  // mention "abort".
+  if (NETWORK_FAILURE_PATTERN.test(message)) {
+    return createCodexFailure("transport", message, true);
   }
 
   if (/\bcancel(?:led|ed)?\b|abort(?:ed)?/i.test(message)) {
@@ -1292,8 +1322,10 @@ function tailLines(text: string, count: number): string {
 }
 
 function needsCodexAuthHelp(text: string): boolean {
+  // URLs are dropped first: a host like auth.openai.com or a /login path in
+  // a network error is not an authentication failure.
   return /\bauth(?:entication)?\b|login|unauthorized|forbidden|expired session|api key|access token/i.test(
-    text
+    text.replace(/\bhttps?:\/\/\S+/gi, " ")
   );
 }
 

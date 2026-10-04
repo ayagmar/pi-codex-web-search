@@ -1239,6 +1239,57 @@ void test("executeCodexWebSearch retries default fast searches as deep/live afte
   assert.match(result.content[0]?.text ?? "", /Recovered on deep\/live retry\./);
 });
 
+for (const stderr of [
+  "ERROR: stream error: connection aborted",
+  "error sending request for url (https://auth.openai.com/oauth/token): dns error",
+]) {
+  void test(`executeCodexWebSearch retries a fast search as deep/live after: ${stderr}`, async () => {
+    const attempts: string[][] = [];
+    const runner: RunCodexCommand = ({ args }) => {
+      attempts.push(args);
+      if (attempts.length === 1) {
+        return Promise.resolve({ code: 1, stdout: "", stderr });
+      }
+
+      const outputPath = args[args.indexOf("--output-last-message") + 1];
+      assert.ok(outputPath);
+      return writeFile(
+        outputPath,
+        JSON.stringify({ summary: "Recovered after a network drop.", sources: [] })
+      ).then(() => ({ code: 0, stdout: "", stderr: "" }));
+    };
+
+    const result = await executeCodexWebSearch({ query: "q" }, { cwd: process.cwd(), runner });
+
+    assert.equal(attempts.length, 2);
+    assert.ok(attempts[1]?.includes('web_search="live"'));
+    assert.equal(result.details.mode, "deep");
+    assert.equal(result.details.retry?.retriedFromFast, true);
+    assert.doesNotMatch(result.details.retry?.fallbackReason ?? "", /codex login/);
+    assert.match(result.content[0]?.text ?? "", /Recovered after a network drop\./);
+  });
+}
+
+void test("executeCodexWebSearch treats a run failing after the caller's abort as cancelled", async () => {
+  const controller = new AbortController();
+  let attempts = 0;
+  const runner: RunCodexCommand = () => {
+    attempts += 1;
+    controller.abort();
+    // The failure text looks like a network drop, but the caller cancelled.
+    return Promise.reject(new Error("stream disconnected before completion"));
+  };
+
+  await assert.rejects(
+    executeCodexWebSearch(
+      { query: "q" },
+      { cwd: process.cwd(), runner, signal: controller.signal }
+    ),
+    /stream disconnected/
+  );
+  assert.equal(attempts, 1);
+});
+
 void test("executeCodexWebSearch does not retry fast timeouts as deep/live", async () => {
   const turnState = { fastModeExhausted: false };
   let attempts = 0;
