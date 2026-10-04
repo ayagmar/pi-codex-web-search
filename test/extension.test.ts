@@ -3,6 +3,7 @@ import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import { stripVTControlCharacters } from "node:util";
 import { type ExtensionAPI, initTheme } from "@earendil-works/pi-coding-agent";
 import { SETTINGS_COMMAND, TOOL_NAME } from "../src/constants.js";
 import codexWebSearchExtension from "../src/index.js";
@@ -423,6 +424,6 @@ void test("the collapsed expand hint keeps its closing parenthesis styled", () =
     // The hint must not sit inside an outer theme span, whose colour the
     // hint's own reset codes would cancel before the closing parenthesis.
     assert.doesNotMatch(output, /<dim> \([^<]/);
-    assert.match(output.replace(/\x1b\[[0-9;]*m/g, ""), /to expand/);
+    assert.match(stripVTControlCharacters(output), /to expand/);
   }
 });
