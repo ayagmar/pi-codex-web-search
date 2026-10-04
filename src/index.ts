@@ -232,7 +232,7 @@ export default function codexWebSearchExtension(pi: ExtensionAPI) {
       }
 
       if (!expanded) {
-        text += theme.fg("dim", ` (${keyHint("app.tools.expand", "to expand")})`);
+        text += `${theme.fg("dim", " (")}${keyHint("app.tools.expand", "to expand")}${theme.fg("dim", ")")}`;
         if (details.failure) {
           text += `\n${theme.fg("dim", formatInlineQuery(details.failure.message, 110))}`;
         } else if (details.latestQuery) {
@@ -834,7 +834,7 @@ function renderProgress(
   );
 
   if (!expanded) {
-    text += theme.fg("dim", ` (${keyHint("app.tools.expand", "to expand")})`);
+    text += `${theme.fg("dim", " (")}${keyHint("app.tools.expand", "to expand")}${theme.fg("dim", ")")}`;
     if (statusEvents.length > 0) {
       text += `\n${theme.fg("dim", formatInlineQuery(statusEvents[statusEvents.length - 1], 110))}`;
     } else if (details?.latestQuery) {

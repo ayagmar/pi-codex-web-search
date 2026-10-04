@@ -3,7 +3,7 @@ import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { type ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { type ExtensionAPI, initTheme } from "@earendil-works/pi-coding-agent";
 import { SETTINGS_COMMAND, TOOL_NAME } from "../src/constants.js";
 import codexWebSearchExtension from "../src/index.js";
 
@@ -379,4 +379,50 @@ void test("a skipped concurrent search renders as skipped, not failed", () => {
 
   const thrown = render({ content: [{ type: "text", text: "Codex says no" }] }, true);
   assert.match(thrown, /Web search failed/);
+});
+
+void test("the collapsed expand hint keeps its closing parenthesis styled", () => {
+  const captured: CapturedExtension = {};
+  codexWebSearchExtension(createMockPi(captured));
+  const renderResult = captured.toolRenderResult;
+  assert.ok(renderResult);
+  // keyHint() colours itself with pi's global theme.
+  initTheme("dark");
+  // Tag each span so a parenthesis left outside any colour is visible.
+  const theme = {
+    fg: (color: string, text: string) => `<${color}>${text}</${color}>`,
+    bold: (text: string) => text,
+  };
+  const render = (isPartial: boolean) =>
+    renderResult(
+      {
+        content: [{ type: "text", text: "Summary" }],
+        details: {
+          mode: "fast",
+          freshness: "cached",
+          query: "q",
+          sourceCount: 0,
+          searchCount: 1,
+          searchQueries: ["q"],
+          statusEvents: [],
+          sources: [],
+          summary: "Summary",
+          truncated: false,
+        },
+      },
+      { expanded: false, isPartial },
+      theme,
+      { isError: false }
+    )
+      .render(400)
+      .join("\n");
+
+  for (const output of [render(false), render(true)]) {
+    assert.match(output, /<dim> \(<\/dim>/);
+    assert.match(output, /<dim>\)<\/dim>/);
+    // The hint must not sit inside an outer theme span, whose colour the
+    // hint's own reset codes would cancel before the closing parenthesis.
+    assert.doesNotMatch(output, /<dim> \([^<]/);
+    assert.match(output.replace(/\x1b\[[0-9;]*m/g, ""), /to expand/);
+  }
 });
