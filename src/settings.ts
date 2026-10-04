@@ -1,5 +1,16 @@
-import { chmod, mkdir, readFile, realpath, rename, rm, stat, writeFile } from "node:fs/promises";
-import { dirname, join } from "node:path";
+import {
+  chmod,
+  lstat,
+  mkdir,
+  readFile,
+  readlink,
+  realpath,
+  rename,
+  rm,
+  stat,
+  writeFile,
+} from "node:fs/promises";
+import { basename, dirname, join, resolve } from "node:path";
 import { getAgentDir, withFileMutationQueue } from "@earendil-works/pi-coding-agent";
 import {
   DEEP_SEARCH_QUERY_BUDGET,
@@ -133,7 +144,7 @@ async function writeSettingsFile(
   const normalized = normalizeSettings(settings);
   // Save through a symlink (dotfile managers such as stow or chezmoi) onto
   // the file it points to, instead of replacing the link.
-  const target = await realpath(path).catch(() => path);
+  const target = await resolveSaveTarget(path);
   await mkdir(dirname(target), { recursive: true });
   // Write a sibling temp file and rename it into place, so a search that
   // reads the settings concurrently never sees a half-written file.
@@ -155,6 +166,47 @@ async function writeSettingsFile(
     throw error;
   }
   return normalized;
+}
+
+// Matches the usual SYMLOOP_MAX.
+const MAX_SYMLINK_HOPS = 40;
+
+function isErrorCode(error: unknown, code: string): boolean {
+  return (error as NodeJS.ErrnoException | undefined)?.code === code;
+}
+
+/**
+ * Resolves the file a save should replace: the end of the symlink chain at
+ * `path`, even when that file does not exist yet (a dangling link created by
+ * a dotfile manager before the dotfile itself).
+ */
+async function resolveSaveTarget(path: string): Promise<string> {
+  try {
+    return await realpath(path);
+  } catch (error) {
+    if (!isErrorCode(error, "ENOENT")) {
+      return path;
+    }
+  }
+  let current = path;
+  for (let hops = 0; hops < MAX_SYMLINK_HOPS; hops++) {
+    let isLink: boolean;
+    try {
+      isLink = (await lstat(current)).isSymbolicLink();
+    } catch (error) {
+      if (!isErrorCode(error, "ENOENT")) {
+        return path;
+      }
+      isLink = false;
+    }
+    if (!isLink) {
+      const parent = dirname(current);
+      const realParent = await realpath(parent).catch(() => parent);
+      return join(realParent, basename(current));
+    }
+    current = resolve(dirname(current), await readlink(current));
+  }
+  return path;
 }
 
 export function formatSettings(settings: WebSearchSettings): string {
