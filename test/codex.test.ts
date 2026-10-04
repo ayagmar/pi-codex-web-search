@@ -2489,3 +2489,30 @@ void test("terminateWithForceKill kills a child that ignores SIGTERM", async () 
     child.kill("SIGKILL");
   }
 });
+
+void test("runCodexCommand reports a missing working directory instead of a missing Codex", {
+  skip: process.platform === "win32",
+}, async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-codex-web-search-missing-cwd-"));
+  const script = join(dir, "codex");
+  await writeFile(script, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+
+  const previousEnv = process.env.PI_CODEX_WEB_SEARCH_CODEX_PATH;
+  process.env.PI_CODEX_WEB_SEARCH_CODEX_PATH = script;
+  try {
+    const missingCwd = join(dir, "deleted-worktree");
+    await assert.rejects(
+      runCodexCommand({ args: [], cwd: missingCwd }),
+      (error: Error) =>
+        error.message.includes(`working directory ${missingCwd} does not exist`) &&
+        !/Could not find `codex`/.test(error.message)
+    );
+  } finally {
+    if (previousEnv === undefined) {
+      delete process.env.PI_CODEX_WEB_SEARCH_CODEX_PATH;
+    } else {
+      process.env.PI_CODEX_WEB_SEARCH_CODEX_PATH = previousEnv;
+    }
+    await rm(dir, { recursive: true, force: true });
+  }
+});
