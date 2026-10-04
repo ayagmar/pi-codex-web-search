@@ -44,7 +44,7 @@
     "release:dry": "release-it --ci --dry-run"
   },
   "dependencies": {
-    "defuddle": "0.19.1"
+    "defuddle": "0.19.4"
   },
   "peerDependencies": {
     "@earendil-works/pi-ai": "*",
