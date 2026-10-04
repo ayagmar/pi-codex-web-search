@@ -1,5 +1,15 @@
 import assert from "node:assert/strict";
-import { lstat, mkdtemp, readdir, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
+import {
+  lstat,
+  mkdir,
+  mkdtemp,
+  readdir,
+  readFile,
+  rm,
+  stat,
+  symlink,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -188,4 +198,30 @@ void test("updateSettings saves through a symlink and keeps the target's mode", 
   });
   assert.equal((await stat(target)).mode & 0o777, 0o600);
   assert.deepEqual((await readdir(dir)).sort(), ["dotfiles-settings.json", "settings.json"]);
+});
+
+void test("saveSettings creates the target of a dangling symlink chain", {
+  skip: process.platform === "win32",
+}, async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-codex-web-search-settings-"));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  await mkdir(join(dir, "agent"));
+  await mkdir(join(dir, "dotfiles"));
+  const link = join(dir, "agent", "settings.json");
+  const middle = join(dir, "agent", "middle.json");
+  const target = join(dir, "dotfiles", "settings.json");
+  // Relative links, as stow creates them; the final file does not exist yet.
+  await symlink("middle.json", link);
+  await symlink("../dotfiles/settings.json", middle);
+
+  await saveSettings({ defaultMode: "deep" }, link);
+
+  assert.equal((await lstat(link)).isSymbolicLink(), true);
+  assert.equal((await lstat(middle)).isSymbolicLink(), true);
+  assert.deepEqual(await loadSettingsStrict(target), {
+    ...DEFAULT_WEB_SEARCH_SETTINGS,
+    defaultMode: "deep",
+  });
+  assert.deepEqual(await readdir(join(dir, "dotfiles")), ["settings.json"]);
+  assert.deepEqual((await readdir(join(dir, "agent"))).sort(), ["middle.json", "settings.json"]);
 });
