@@ -1,6 +1,6 @@
 import { type ChildProcess, spawn } from "node:child_process";
 import { constants as fsConstants } from "node:fs";
-import { access, readdir } from "node:fs/promises";
+import { access, readdir, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -56,6 +56,14 @@ class CodexCommandNotFoundError extends Error {
 export async function runCodexCommand(
   options: RunCodexCommandOptions
 ): Promise<RunCodexCommandResult> {
+  // spawn reports a missing working directory as ENOENT, which would
+  // otherwise read as "Codex is not installed".
+  if (!(await isDirectory(options.cwd))) {
+    throw new Error(
+      `Failed to start Codex CLI: the working directory ${options.cwd} does not exist.`
+    );
+  }
+
   const tried: string[] = [];
 
   for (const command of getConfiguredCodexCommands()) {
@@ -172,6 +180,14 @@ async function readDirectoryNames(path: string): Promise<string[]> {
     return entries.filter((entry) => entry.isDirectory()).map((entry) => entry.name);
   } catch {
     return [];
+  }
+}
+
+async function isDirectory(path: string): Promise<boolean> {
+  try {
+    return (await stat(path)).isDirectory();
+  } catch {
+    return false;
   }
 }
 
