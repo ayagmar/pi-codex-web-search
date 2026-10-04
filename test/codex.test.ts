@@ -2442,3 +2442,29 @@ void test("runCodexCommand survives Codex exiting before it reads the prompt", {
     await rm(dir, { recursive: true, force: true });
   }
 });
+
+void test("executeCodexWebSearch heartbeats report the current elapsed time", async (t) => {
+  t.mock.timers.enable({ apis: ["setInterval", "Date"], now: 0 });
+  const statusTexts: string[] = [];
+  const runner: RunCodexCommand = () => {
+    // No Codex events for one heartbeat interval.
+    t.mock.timers.tick(8_000);
+    return Promise.resolve({ code: 1, stdout: "", stderr: "stream disconnected" });
+  };
+
+  await executeCodexWebSearch(
+    { query: "quiet search", mode: "deep" },
+    {
+      cwd: process.cwd(),
+      runner,
+      onUpdate: (update) => {
+        const details = update.details as { statusText?: string } | undefined;
+        statusTexts.push(details?.statusText ?? "");
+      },
+    }
+  );
+
+  const heartbeat = statusTexts.find((line) => line.startsWith("Still "));
+  assert.ok(heartbeat, `expected a heartbeat, got ${JSON.stringify(statusTexts)}`);
+  assert.match(heartbeat, /^Still waiting for search activity · 8s /);
+});

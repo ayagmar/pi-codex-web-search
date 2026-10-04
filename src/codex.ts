@@ -554,6 +554,9 @@ async function runResolvedCodexWebSearch(
       return;
     }
 
+    // Refresh the elapsed time first: it was last updated by the previous
+    // progress event, up to a full heartbeat interval ago.
+    updateProgressElapsed(progress);
     emitProgressUpdate(options, progress, buildHeartbeatStatus(progress, policy.timeoutMs));
   }, 8_000);
   heartbeatId.unref?.();
