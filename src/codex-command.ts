@@ -1,4 +1,4 @@
-import { spawn } from "node:child_process";
+import { type ChildProcess, spawn } from "node:child_process";
 import { constants as fsConstants } from "node:fs";
 import { access, readdir } from "node:fs/promises";
 import { homedir } from "node:os";
@@ -189,6 +189,21 @@ export function toCancellationError(reason: unknown, fallbackMessage: string): E
   return new Error(typeof reason === "string" ? reason : fallbackMessage);
 }
 
+/** How long a child gets to exit after SIGTERM before it is sent SIGKILL. */
+export const FORCE_KILL_DELAY_MS = 2_000;
+
+/**
+ * Sends SIGTERM to a child that runs in the caller's process group, then
+ * SIGKILL if it has not exited after `delayMs`. `child.kill` is a no-op once
+ * the child has exited, so a late SIGKILL can never reach a recycled PID.
+ */
+export function terminateWithForceKill(child: ChildProcess, delayMs = FORCE_KILL_DELAY_MS): void {
+  child.kill("SIGTERM");
+  const forceKillId = setTimeout(() => child.kill("SIGKILL"), delayMs);
+  forceKillId.unref?.();
+  child.once("close", () => clearTimeout(forceKillId));
+}
+
 function terminateChild(
   child: ReturnType<typeof spawn>,
   afterTerminate?: () => void,
@@ -244,7 +259,10 @@ function spawnCodexCommand(
     };
 
     const scheduleForceKill = (): void => {
-      forceKillId = setTimeout(() => terminateChild(child, undefined, "SIGKILL"), 2_000);
+      forceKillId = setTimeout(
+        () => terminateChild(child, undefined, "SIGKILL"),
+        FORCE_KILL_DELAY_MS
+      );
       forceKillId.unref?.();
     };
 

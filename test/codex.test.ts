@@ -1,4 +1,6 @@
 import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
+import { once } from "node:events";
 import { chmod, mkdir, mkdtemp, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -22,6 +24,7 @@ import {
   MAX_CAPTURED_STDERR_BYTES,
   MAX_CAPTURED_STDOUT_BYTES,
   runCodexCommand,
+  terminateWithForceKill,
 } from "../src/codex-command.js";
 import { DEFAULT_FAST_MAX_SOURCES, MAX_ALLOWED_SOURCES } from "../src/constants.js";
 import {
@@ -2467,4 +2470,22 @@ void test("executeCodexWebSearch heartbeats report the current elapsed time", as
   const heartbeat = statusTexts.find((line) => line.startsWith("Still "));
   assert.ok(heartbeat, `expected a heartbeat, got ${JSON.stringify(statusTexts)}`);
   assert.match(heartbeat, /^Still waiting for search activity · 8s /);
+});
+
+void test("terminateWithForceKill kills a child that ignores SIGTERM", async () => {
+  const child = spawn(
+    process.execPath,
+    ["-e", "process.on('SIGTERM', () => {}); console.log('ready'); setInterval(() => {}, 1000);"],
+    { stdio: ["ignore", "pipe", "ignore"] }
+  );
+  try {
+    await once(child.stdout, "data");
+    const closed = once(child, "close");
+    terminateWithForceKill(child, 100);
+    const [code, signal] = (await closed) as [number | null, NodeJS.Signals | null];
+    assert.equal(code, null);
+    assert.equal(signal, "SIGKILL");
+  } finally {
+    child.kill("SIGKILL");
+  }
 });

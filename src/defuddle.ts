@@ -1,7 +1,7 @@
 import { spawn } from "node:child_process";
 import { createRequire } from "node:module";
 import { dirname, join } from "node:path";
-import { appendBounded, toCancellationError } from "./codex-command.js";
+import { appendBounded, terminateWithForceKill, toCancellationError } from "./codex-command.js";
 import { DEFUDDLE_TIMEOUT_MS } from "./constants.js";
 import { type DefuddleParseResult, type RunDefuddleCommandOptions } from "./types.js";
 
@@ -136,7 +136,7 @@ export async function runDefuddleCommand(
     };
 
     const onAbort = (): void => {
-      child.kill("SIGTERM");
+      terminateWithForceKill(child);
       const error = toCancellationError(
         options.signal?.reason,
         "Defuddle extraction was cancelled."
@@ -146,7 +146,7 @@ export async function runDefuddleCommand(
 
     const timeoutMs = options.timeoutMs ?? DEFUDDLE_TIMEOUT_MS;
     timeoutId = setTimeout(() => {
-      child.kill("SIGTERM");
+      terminateWithForceKill(child);
       finish(() => {
         reject(
           new Error(`Defuddle extraction timed out after ${Math.ceil(timeoutMs / 1000)} seconds.`)
